@@ -36,7 +36,7 @@
 
 using namespace std;
 
-#define VBL_VERSION     "1.0"
+#define VBL_VERSION     "1.1"
 
 #define KEY_CTRL_C      0x03
 #define KEY_TAB         0x09
@@ -107,8 +107,6 @@ typedef off_t    FPos;  // long int
 typedef ssize_t  Size;  // long int
 
 const File InvalidFile = -1;
-
-int ESCDELAY = 10;
 
 int safeUC(int key);
 char *pretty(char *buffer, FPos *size, int sign);
@@ -195,6 +193,7 @@ class ConWindow  // ##con
 bool ConWindow::startup()
 {
   if (!initscr()) return false; // initialize the curses library
+  set_escdelay(10);             // for static linking
   atexit(ConWindow::shutdown);  // just in case
 
   keypad(stdscr, true);         // enable keyboard mapping

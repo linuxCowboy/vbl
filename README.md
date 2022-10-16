@@ -57,7 +57,12 @@ meson setup vbl && meson compile -C vbl
 Test:
 -----
 
-`./vbl/vbl`
+```
+./vbl/vbl
+./vbl/vbl-strip
+./vbl/vbl-stat
+./vbl/vbl-stat-strip
+```
 
 Screenshoots:
 -------------
