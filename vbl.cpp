@@ -5,6 +5,8 @@
 //   Copyright 1995-2017 by Christopher J. Madsen
 //   Copyright 2021-2022 by linuxCowboy
 //
+//   64GB by Bradley Grainger
+//
 //   Visual display of differences in binary files
 //
 //   This program is free software; you can redistribute it and/or
@@ -36,7 +38,7 @@
 
 using namespace std;
 
-#define VBL_VERSION     "1.1"
+#define VBL_VERSION     "1.2"
 
 #define KEY_CTRL_C      0x03
 #define KEY_TAB         0x09
@@ -102,9 +104,106 @@ static const attr_t attribStyle[] = {
   A_BOLD    | COLOR_PAIR(colorStyle[ cHotKey     ])
 };
 
+//====================================================================
+// Type definitions
+
+typedef unsigned char   Byte;
+typedef Byte  Command;
+
 typedef int      File;
 typedef off_t    FPos;  // long int
 typedef ssize_t  Size;  // long int
+
+enum LockState { lockNeither, lockTop, lockBottom };
+
+//--------------------------------------------------------------------
+// Strings
+
+typedef string  String;
+
+typedef String::size_type      StrIdx;
+typedef String::iterator       StrItr;
+typedef String::const_iterator StrConstItr;
+
+//--------------------------------------------------------------------
+// Vectors
+
+typedef vector<String>          StrVec;
+typedef StrVec::iterator        SVItr;
+typedef StrVec::const_iterator  SVConstItr;
+
+typedef StrVec::size_type  VecSize;
+
+//--------------------------------------------------------------------
+// Map
+
+typedef map<VecSize, String>    StrMap;
+typedef StrMap::value_type      SMVal;
+typedef StrMap::iterator        SMItr;
+typedef StrMap::const_iterator  SMConstItr;
+
+//====================================================================
+// Constants   :##cmd
+
+const Command  cmmMove        = 0x80;  // Main cmd
+const Command  cmmMoveForward = 0x40;
+const Command  cmmMoveByte    = 0x00;  // Move 1 byte
+const Command  cmmMoveLine    = 0x01;  // Move 1 line
+const Command  cmmMovePage    = 0x02;  // Move 1 page
+const Command  cmmMoveAll     = 0x03;  // Move to beginning or end
+const Command  cmmMoveSize    = 0x03;  // Mask
+
+const Command  cmfFind        = 0x40;  // Main cmd
+const Command  cmfFindNext    = 0x20;
+const Command  cmfFindPrev    = 0x10;
+const Command  cmfNotCharDn   = 0x02;
+const Command  cmfNotCharUp   = 0x01;
+
+const Command  cmgGoto        = 0x20;  // Main cmd
+const Command  cmgGotoTop     = 0x08;  // Flag
+const Command  cmgGotoBottom  = 0x04;  // Flag
+const Command  cmgGotoForw    = 0x02;
+const Command  cmgGotoBack    = 0x01;
+
+const Command  cmNothing      = 0;
+const Command  cmUseTop       = 1;
+const Command  cmUseBottom    = 2;
+const Command  cmNextDiff     = 3;
+const Command  cmPrevDiff     = 4;
+const Command  cmEditTop      = 5;
+const Command  cmEditBottom   = 6;
+const Command  cmSyncUp       = 7;
+const Command  cmSyncDn       = 8;
+const Command  cmShowRaster   = 9;
+const Command  cmShowHelp     = 10;
+const Command  cmSmartScroll  = 11;
+const Command  cmQuit         = 12;
+
+//--------------------------------------------------------------------
+const int screenWidth = 140;  // Key value - but _must_ be constant!
+//--------------------------------------------------------------------
+
+const int screenHeight = 24;  // Enforced minimum height
+
+const int  lineWidth = 32;    // Number of bytes displayed per line
+const short leftMar  = 11;    // Starting column of hex display
+const short leftMar2 = 108;   // Starting column of ASCII display
+
+const int promptHeight = 3;   // Height of prompt window
+const int inWidth = 12;       // Width of input window (excluding border)
+
+const int searchIndent = lineWidth * 3;  // Lines of search result indentation
+
+const int skipForw = 5;  // Percent to skip forward
+const int skipBack = 1;  // Percent to skip backward
+
+const int maxPath = 260;
+
+const VecSize maxHistory = 2000;
+
+const char hexDigits[] = "0123456789ABCDEF%X";  // with Goto % and Goto hex
+
+const char thouSep = '.';  // thousands separator (or '\0')
 
 const File InvalidFile = -1;
 
@@ -114,10 +213,45 @@ void showEditPrompt();
 void showPrompt();
 void exitMsg(int status, const char *message);
 
-//====================================================================
-// FileIO
+//--------------------------------------------------------------------
+// Help panel text - max 21 lines (screenHeight - 3)
 
-inline File OpenFile(const char* path, bool writable=false)  // ##io
+const char *aHelp[] = {
+"  ",
+"  ENTER   smartscroll",
+"  PgDn    next different byte",
+"  PgUp    prev different byte",
+"  ",
+"  Find Next Prev   search",
+"  Goto             dec 0x x %",  /* longest */
+"  + *     skip +5%",
+"  -       skip -1%",
+"  ",
+"  E       edit file",
+"  R       show raster",
+"  Q Esc   quit",
+"  ",
+"      --- Two Files ---",
+"  Enter     next diff",
+"  # \\ =     prev diff",
+"  1 2       sync views",
+"  T         use only top",
+"  B         use only bottom",
+"  "
+};
+
+const int longestLine = 29;  // adjust!
+
+const Byte aBold[] = { 6,3, 6,8, 6,13, 7,3, '\0' };  // hotkeys, with border
+//--------------------------------------------------------------------
+
+const int helpWidth = 1 + longestLine + 2 + 1;
+const int helpHeight = 1 + sizeof(aHelp) / sizeof(aHelp[0]) + 1;
+
+//====================================================================
+// FileIO   :##io
+
+inline File OpenFile(const char* path, bool writable=false)
 {
   return open(path, (writable ? O_RDWR : O_RDONLY));
 }
@@ -158,9 +292,9 @@ inline FPos SeekFile(File file, FPos position, int whence=SEEK_SET)
 }
 
 //====================================================================
-// Class ConWindow
+// Class ConWindow   :##con
 
-class ConWindow  // ##con
+class ConWindow
 {
  protected:
   PANEL   *pan;
@@ -335,100 +469,6 @@ void ConWindow::setCursor(short x, short y)
 }
 
 //====================================================================
-// Type definitions
-
-typedef unsigned char   Byte;
-typedef Byte  Command;
-
-enum LockState { lockNeither, lockTop, lockBottom };
-
-//--------------------------------------------------------------------
-// Strings
-
-typedef string  String;
-
-typedef String::size_type      StrIdx;
-typedef String::iterator       StrItr;
-typedef String::const_iterator StrConstItr;
-
-//--------------------------------------------------------------------
-// Vectors
-
-typedef vector<String>          StrVec;
-typedef StrVec::iterator        SVItr;
-typedef StrVec::const_iterator  SVConstItr;
-
-typedef StrVec::size_type  VecSize;
-
-//--------------------------------------------------------------------
-// Map
-
-typedef map<VecSize, String>    StrMap;
-typedef StrMap::value_type      SMVal;
-typedef StrMap::iterator        SMItr;
-typedef StrMap::const_iterator  SMConstItr;
-
-//====================================================================
-// Constants
-
-const Command  cmmMove        = 0x80;  // Main cmd  ##cmd
-const Command  cmmMoveForward = 0x40;
-const Command  cmmMoveByte    = 0x00;  // Move 1 byte
-const Command  cmmMoveLine    = 0x01;  // Move 1 line
-const Command  cmmMovePage    = 0x02;  // Move 1 page
-const Command  cmmMoveAll     = 0x03;  // Move to beginning or end
-const Command  cmmMoveSize    = 0x03;  // Mask
-
-const Command  cmfFind        = 0x40;  // Main cmd
-const Command  cmfFindNext    = 0x20;
-const Command  cmfFindPrev    = 0x10;
-const Command  cmfNotCharDn   = 0x02;
-const Command  cmfNotCharUp   = 0x01;
-
-const Command  cmgGoto        = 0x20;  // Main cmd
-const Command  cmgGotoTop     = 0x08;  // Flag
-const Command  cmgGotoBottom  = 0x04;  // Flag
-const Command  cmgGotoForw    = 0x02;
-const Command  cmgGotoBack    = 0x01;
-
-const Command  cmNothing      = 0;
-const Command  cmUseTop       = 1;
-const Command  cmUseBottom    = 2;
-const Command  cmNextDiff     = 3;
-const Command  cmPrevDiff     = 4;
-const Command  cmEditTop      = 5;
-const Command  cmEditBottom   = 6;
-const Command  cmSyncUp       = 7;
-const Command  cmSyncDn       = 8;
-const Command  cmShowRaster   = 9;
-const Command  cmSmartScroll  = 10;
-const Command  cmQuit         = 11;
-
-//--------------------------------------------------------------------
-const int screenWidth = 140;  // Key value - but _must_ be constant!
-//--------------------------------------------------------------------
-
-const int  lineWidth = 32;   // Number of bytes displayed per line
-const short leftMar  = 11;   // Starting column of hex display
-const short leftMar2 = 108;  // Starting column of ASCII display
-
-const int promptHeight = 3;  // Height of prompt window
-const int inWidth = 12;      // Width of input window (excluding border)
-
-const int searchIndent = lineWidth * 3;  // Lines of search result indentation
-
-const int skipForw = 5;  // Percent to skip forward
-const int skipBack = 1;  // Percent to skip backward
-
-const int maxPath = 260;
-
-const VecSize maxHistory = 2000;
-
-const char hexDigits[] = "0123456789ABCDEF%X";  // with Goto % and Goto hex
-
-const char thouSep = '.';  // thousands separator (or '\0')
-
-//====================================================================
 // Class Declarations
 
 class Difference;
@@ -439,7 +479,7 @@ union FileBuffer
   Byte  buffer[lineWidth];
 };
 
-class FileDisplay  // ##file
+class FileDisplay  // :##file
 {
  friend class Difference;
 
@@ -454,7 +494,6 @@ class FileDisplay  // ##file
   FPos               prevOffset;
   ConWindow          win;
   bool               writable;
-  int                yPos;
 
  public:
   FileDisplay();
@@ -529,21 +568,22 @@ class InputManager
 }; // end InputManager
 
 //====================================================================
-// Global Variables
+// Global Variables   :##glob
 
-String      lastSearch;  // ##glob
+String      lastSearch;
 StrVec      hexSearchHistory, textSearchHistory, positionHistory;
-ConWindow   promptWin, inWin;
+ConWindow   promptWin, inWin, helpWin;
 FileDisplay file1, file2;
 Difference  diffs(&file1, &file2);
-const char *program_name; // Name under which this program was invoked
+const char *program_name;  // Name under which this program was invoked
 LockState   lockState;
 bool        singleFile;
 bool        showRaster;
 
-int  numLines  = 9;       // Number of lines of each file to display
-int  bufSize   = numLines * lineWidth;
-int  linesBetween = 1;    // Number of lines of padding between files
+int  linesTotal;    // Number of lines in curses
+int  numLines;      // Number of lines of each file to display
+int  linesBetween;  // Number of lines of padding between files
+int  bufSize;       // Number of bytes of each file to display
 
 // The number of bytes to move for each possible step size
 //   See cmmMoveByte, cmmMoveLine, cmmMovePage
@@ -552,7 +592,7 @@ int  steps[4] = {1, lineWidth, bufSize-lineWidth, 0};
 //====================================================================
 // Class Difference
 
-Difference::Difference(const FileDisplay* aFile1, const FileDisplay* aFile2)  // ##diff
+Difference::Difference(const FileDisplay* aFile1, const FileDisplay* aFile2)
 : data(NULL),
   file1(aFile1),
   file2(aFile2)
@@ -625,7 +665,6 @@ FileDisplay::FileDisplay()
   offset(0),
   prevOffset(0),
   writable(false),
-  yPos(0),
   searchOff(0),
   scrollOff(0),
   se4rch(0),
@@ -638,7 +677,6 @@ FileDisplay::FileDisplay()
 void FileDisplay::init(int y, const Difference* aDiff)
 {
   diffs = aDiff;
-  yPos  = y;
 
   win.init(0, y, screenWidth, (numLines + 1 + (y ? 0 : linesBetween)), cFileWin);
 
@@ -670,9 +708,9 @@ void FileDisplay::shutDown()
 }
 
 //--------------------------------------------------------------------
-// Display the file contents
+// Display the file contents   :##disp
 
-void FileDisplay::display()  // ##disp
+void FileDisplay::display()
 {
         if (! fileName[0]) return;
 
@@ -937,9 +975,9 @@ void FileDisplay::setByte(short x, short y, Byte b)
 } // end FileDisplay::setByte
 
 //--------------------------------------------------------------------
-// Change the file position
+// Change the file position   :##move
 
-void FileDisplay::moveTo(FPos newOffset)  //  ##move
+void FileDisplay::moveTo(FPos newOffset)
 {
         if (! fileName[0]) return;
 
@@ -998,6 +1036,7 @@ bool FileDisplay::moveTo(const Byte* searchFor, int searchLen)
         }
         advance = false;
         delete [] searchBuf;
+        moveToEnd();
         return false;
 } // end FileDisplay::moveTo
 
@@ -1044,6 +1083,7 @@ bool FileDisplay::moveToBack(const Byte* searchFor, int searchLen)
         }
         advance = false;
         delete [] searchBuf;
+        moveTo(0);
         return false;
 } // end FileDisplay::moveToBack
 
@@ -1516,9 +1556,9 @@ void InputManager::useHistory(int delta)
 } // end useHistory
 
 //====================================================================
-// Global Functions
+// Global Functions   :##gf
 
-void calcScreenLayout(bool resize = true)  // ##gf
+void calcScreenLayout(bool resize = true)
 {
   int  screenX, screenY;
 
@@ -1531,14 +1571,15 @@ void calcScreenLayout(bool resize = true)  // ##gf
     exitMsg(2, err.str().c_str());
   }
 
-  if (screenY < promptHeight + 4) {
+  if (screenY < screenHeight) {
     ostringstream  err;
     err << "The screen must be at least "
-        << (promptHeight + 4) << " lines high.";
+        << screenHeight << " lines high.";
     exitMsg(2, err.str().c_str());
   }
 
   numLines = screenY - promptHeight - (singleFile ? 1 : 2);
+  linesTotal = screenY;
 
   if (singleFile)
     linesBetween = 0;
@@ -1611,9 +1652,9 @@ void getString(char* buf, int maxLen, StrVec& history,
 }
 
 //--------------------------------------------------------------------
-// (Hot)keys in promptWin
+// (Hot)keys in promptWin   :##hkey
 
-void displayLockState()  // ##lock
+void displayLockState()
 {
         promptWin.putAttribs(49,  1, cHotKey, 1);  // Find
         promptWin.putAttribs(55,  1, cHotKey, 1);  // Next
@@ -1670,6 +1711,16 @@ void displaySearch(Byte cmd)
         else if (cmd & cmfNotCharUp)   { promptWin.putAttribs(86, 1, cCurrentMode, 4); }
 
         promptWin.update();
+}
+
+//--------------------------------------------------------------------
+// Move help window in stack
+
+void displayHelp()
+{
+        helpWin.update();
+        getch();
+        helpWin.hide();
 }
 
 //--------------------------------------------------------------------
@@ -1743,9 +1794,9 @@ void showEditPrompt()
 }
 
 //--------------------------------------------------------------------
-// Display prompt window
+// Display prompt window   :##show
 
-void showPrompt()  // ##show
+void showPrompt()
 {
         promptWin.clear();
         promptWin.Border();
@@ -1772,19 +1823,35 @@ void showPrompt()  // ##show
 
 bool initialize()
 {
-        if (! ConWindow::startup())
+        if (! ConWindow::startup())  // curses init
                 return false;
 
         ConWindow::hideCursor();
 
-        calcScreenLayout(false);
+        calcScreenLayout(false);  // global vars
 
         inWin.init(0, 0, inWidth + 2, 3, cPromptBdr);
         inWin.Border();
-
         inWin.put((inWidth - 4) / 2, 0, " Goto ");
         inWin.setAttribs(cPromptWin);
         inWin.hide();
+
+        helpWin.init(1 + (screenWidth - helpWidth) / 2, 1 + (linesTotal - helpHeight) / 3, helpWidth, helpHeight, cPromptBdr);
+        helpWin.Border();
+
+        helpWin.put((helpWidth - 6) / 2, 0, " Help ");
+        helpWin.put((helpWidth - 20 - 3 - 1) / 2, helpHeight - 1, " VBinDiff for Linux " VBL_VERSION " ");
+
+        for (size_t i=0; i < helpHeight - 1 - 1; ++i) {  // exclude border
+                helpWin.put(1, i + 1, aHelp[i]);
+        }
+
+        for (int i=0; aBold[i]; i += 2) {
+                helpWin.putAttribs(aBold[i + 1], aBold[i], cHotKey, 1);
+        }
+
+        helpWin.setAttribs(cPromptWin);
+        helpWin.hide();
 
         int y;
         if (singleFile) {
@@ -1805,12 +1872,12 @@ bool initialize()
                 file2.init(numLines + linesBetween + 1, &diffs);
 
         return true;
-}
+} // end initialize
 
 //--------------------------------------------------------------------
-// Get a command from the keyboard
+// Get a command from the keyboard   :##get
 
-Command getCommand()  // ##get
+Command getCommand()
 {
         Command cmd = cmNothing;
 
@@ -1863,6 +1930,8 @@ Command getCommand()  // ##get
                         case '2':  cmd = cmSyncDn; break;
 
                         case 'R':  cmd = cmShowRaster; break;
+
+                        case 'H':  cmd = cmShowHelp; break;
 
                         case KEY_ESCAPE:
                         case KEY_CTRL_C:
@@ -2010,9 +2079,9 @@ void searchFiles(Command cmd)
 } // end searchFiles
 
 //--------------------------------------------------------------------
-// Handle a command
+// Handle a command   :##hand
 
-void handleCmd(Command cmd)  //  ##hand
+void handleCmd(Command cmd)
 {
         if (cmd & cmmMove) {
                 int step = steps[cmd & cmmMoveSize];
@@ -2152,6 +2221,10 @@ void handleCmd(Command cmd)  //  ##hand
                 showRaster ^= true;
         }
 
+        else if (cmd == cmShowHelp) {
+                displayHelp();
+        }
+
         else if (cmd == cmEditTop) {
                 file1.edit(singleFile ? NULL : &file2);
         }
@@ -2177,9 +2250,9 @@ void handleCmd(Command cmd)  //  ##hand
 } // end handleCmd
 
 //====================================================================
-// Main Program
+// Main Program   :##main
 
-int main(int argc, char* argv[])  // ##main
+int main(int argc, char* argv[])
 {
         if ((program_name = strrchr(argv[0], '/')))
                 ++program_name;
@@ -2189,7 +2262,11 @@ int main(int argc, char* argv[])  // ##main
         cout << "VBinDiff for Linux " << VBL_VERSION << endl;
 
         if (argc < 2 || argc > 3) {
-                cout << "\n\t" << program_name << " file1 [file2]\n\n";
+                cout << "\n"
+                        "\t" << program_name << " file1 [file2]\n"
+                        "\n"
+                        "// type 'h' for help\n"
+                        << endl;
                 exit(0);
         }
         singleFile = (argc == 2);
@@ -2249,6 +2326,7 @@ int main(int argc, char* argv[])  // ##main
         file1.shutDown();
         file2.shutDown();
 
+        helpWin.close();
         inWin.close();
         promptWin.close();
 

@@ -67,11 +67,14 @@ Test:
 Screenshoots:
 -------------
 
-![Screenshot - single mode](pics/screenshot1.png)
+![Screenshot - single mode](pics/screenshot1.png)  
 *Single File*
 
-![Screenshot - compare mode](pics/screenshot2.png)
+![Screenshot - compare mode](pics/screenshot2.png)  
 *Two Files*
+
+![Screenshot - help pad](pics/vbl-help.png)  
+*Help Pad*
 
 -----
 
