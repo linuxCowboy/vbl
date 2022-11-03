@@ -38,7 +38,7 @@
 
 using namespace std;
 
-#define VBL_VERSION     "1.2"
+#define VBL_VERSION     "1.3"
 
 #define KEY_CTRL_C      0x03
 #define KEY_TAB         0x09
@@ -197,7 +197,7 @@ const int searchIndent = lineWidth * 3;  // Lines of search result indentation
 const int skipForw = 5;  // Percent to skip forward
 const int skipBack = 1;  // Percent to skip backward
 
-const int maxPath = 260;
+const int maxPath = 2000;
 
 const VecSize maxHistory = 2000;
 
@@ -733,7 +733,7 @@ void FileDisplay::display()
                 memcpy(bufStat, fileName, size_fname);
         }
         else {
-                first = size_fname / 4;
+                first = size_name / 4;
                 memcpy(bufStat, fileName, first);
                 memcpy(bufStat + first, " ... ", 5);
 
