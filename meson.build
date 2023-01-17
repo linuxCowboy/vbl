@@ -6,8 +6,8 @@ if meson.version().version_compare('< 0.54.0')
         error('meson too old')
 endif
 
-curses_dyn = [dependency('panelw'), dependency('ncursesw')]
-curses_sta = [dependency('panelw', static: true), dependency('ncursesw', static: true)]
+curses_dyn = [dependency('ncursesw')]
+curses_sta = [dependency('ncursesw', static: true)]
 
 obj = executable('vbl', 'vbl.cpp', dependencies: curses_dyn, cpp_args: '-m64')
 obj = obj.extract_objects('vbl.cpp')
