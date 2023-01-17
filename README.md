@@ -5,44 +5,52 @@ Hex viewer and differ
 
 For you Linuxer!
 
-*32 byte hex & ascii view in a 140 columns terminal*
+dynamic 16/24/32 byte Hex & ASCII view in a terminal
 
-64-bit
+256TB Files
+
+64-bit static + dynamic
 
 based on "*VBinDiff - Visual Binary Diff*" by Christopher J. Madsen
 
 Features:
 ---------
 
- - Ascii search __f__
+ - Ascii search `f`
  - Binary search
- - Forward search __n__
- - Backward search __p__
- - Search history
+ - Forward search `n`
+ - Backward search `p`
+ - Case insensitive `i`
+ - Search history `Up` `Dn`
+ - Search edit `Ins` `Del` `^u` `^k`
  - Search highlight
  - Search indentation
- - Marked hotkeys
+ - Search interruption `ANY`
  - Visual feedback
- - 64GB file handling
- - Goto position decimal __g__
+ - Goto position decimal `g`
  - Goto position percent
  - Goto position hex (abcd 0x1234 1234x)
- - Next difference __Enter__ (two files)
- - Prev difference __# \\ =__ (two files)
- - Next different byte __PgDn__
- - Prev different byte __PgUp__
- - Sync 1. with 2. view __1__ (two files)
- - Sync 2. with 1. view __2__ (two files)
+ - Goto history `Up` `Dn`
+ - Next difference `Enter` (two files)
+ - Prev difference `#` `\` (two files)
+ - Next different byte `PgDn`
+ - Prev different byte `PgUp`
+ - Sync 1. with 2. view `1` (two files)
+ - Sync 2. with 1. view `2` (two files)
  - File position decimal
  - File position percent
  - File offset difference
- - _Smartscroll_ (single mode) __ENTER__
- - Skip forward 5% __+ *__
- - Skip backward 1% __-__
- - Column raster __r__
- - Edit file (overwrite) __e__
- - Use only top file __t__
- - Use only bottom file __b__
+ - _Smartscroll_ (single mode) `ENTER`
+ - Skip forward 4% `+` `*` `=`
+ - Skip backward 1% `-`
+ - ASCII-Mode (single mode) `a`
+ - Column raster `r`
+ - Edit file (overwrite) `e`
+ - RW/RO detection
+ - Use only top file `t`
+ - Use only bottom file `b`
+ - Help window `h`
+ - Quit `q` `Esc`
 
 Build:
 ------
@@ -67,15 +75,17 @@ Test:
 Screenshoots:
 -------------
 
-![Screenshot - single mode](pics/screenshot1.png)  
-*Single File*
+![Screenshot](pics/one.jpg)
+*One File*
 
-![Screenshot - compare mode](pics/screenshot2.png)  
+![Screenshot](pics/ascii.jpg)
+*ASCII Mode*
+
+![Screenshot](pics/64gb.jpg)
+*Files >64GB*
+
+![Screenshot](pics/two.jpg)
 *Two Files*
 
-![Screenshot - help pad](pics/vbl-help.png)  
-*Help Pad*
-
------
-
-*„Der König ist tot, es lebe der König!“*
+![Screenshot](pics/help.jpg)
+*Help Screen*
