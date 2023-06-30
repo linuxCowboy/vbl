@@ -30,6 +30,7 @@ Features:
  - Goto position decimal `g`
  - Goto position percent
  - Goto position hex (abcd 0x1234 1234x)
+ - Goto position offset (+addr -addr)
  - Goto history `Up` `Dn`
  - Next difference `Enter` (two files)
  - Prev difference `#` `\` (two files)
