@@ -25,6 +25,7 @@
 //      2.10    kick sstream
 //      2.11    kick algorithm
 //      2.12    ignore case
+//      2.13    relative jumps
 //
 //   This program is free software; you can redistribute it and/or
 //   modify it under the terms of the GNU General Public License as
@@ -52,7 +53,7 @@
 
 using namespace std;
 
-#define VBL_VERSION     "2.12"
+#define VBL_VERSION     "2.13"
 
 /* set Cursor Color in input window: but _REMAINS_ after Exit!
    - set it when curs_set(2) has no effect
@@ -211,7 +212,7 @@ const int sizeReadBuf = 0x1000000;  // speedup compute()
 
 const int maxHistory = 50;
 
-const char hexDigits[] = "0123456789ABCDEF%X";  // with Goto % and Goto hex
+const char hexDigits[] = "0123456789ABCDEF%X+-";  // with Goto %, hex and rel
 
 const char thouSep = '.';  // thousands separator (or '\0')
 
@@ -1721,7 +1722,7 @@ void calcScreenLayout()  // :##y
 
         lineWidthAsc = lineWidth * 4;
 
-        inWidth = sizeTera ? 15 : 11;
+        inWidth = (sizeTera ? 15 : 11) + 1;  // sign
 
         linesTotal = LINES;
 
@@ -1998,6 +1999,19 @@ void gotoPosition(Command cmd)
 
         FPos pos1 = 0, pos2 = 0;
 
+        int rel = 0;
+        if (*buf == '+') {
+                ++rel;
+        }
+
+        if (*buf == '-') {
+                --rel;
+        }
+
+        if (rel) {
+                *buf = ' ';
+        }
+
         if (strchr(buf, '%')) {
                 int i = atoi(buf);
 
@@ -2018,10 +2032,20 @@ void gotoPosition(Command cmd)
         }
 
         if (cmd & cmgGotoTop) {
-                file1.moveTo(pos1);
+                if (rel) {
+                        file1.move(rel > 0 ? pos1 : -pos1);
+                }
+                else {
+                        file1.moveTo(pos1);
+                }
         }
         if (cmd & cmgGotoBottom) {
-                file2.moveTo(pos2);
+                if (rel) {
+                        file2.move(rel > 0 ? pos2 : -pos2);
+                }
+                else {
+                        file2.moveTo(pos2);
+                }
         }
 } // end gotoPosition
 
