@@ -31,7 +31,8 @@ Features:
  - Goto position percent
  - Goto position hex (abcd 0x1234 1234x)
  - Goto position offset (+addr -addr)
- - Goto history `Up` `Dn`
+ - Goto position history `Up` `Dn`
+ - Goto last `'` `.`
  - Next difference `Enter` (two files)
  - Prev difference `#` `\` (two files)
  - Next different byte `PgDn`
@@ -88,5 +89,5 @@ Screenshoots:
 ![Screenshot](pics/two.jpg)
 *Two Files*
 
-![Screenshot](pics/help.jpg)
+![Screenshot](pics/help.png)
 *Help Screen*
