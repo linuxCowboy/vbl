@@ -26,6 +26,7 @@
 //      2.11    kick algorithm
 //      2.12    ignore case
 //      2.13    relative jumps
+//      2.14    goto back
 //
 //   This program is free software; you can redistribute it and/or
 //   modify it under the terms of the GNU General Public License as
@@ -53,7 +54,7 @@
 
 using namespace std;
 
-#define VBL_VERSION     "2.13"
+#define VBL_VERSION     "2.14"
 
 /* set Cursor Color in input window: but _REMAINS_ after Exit!
    - set it when curs_set(2) has no effect
@@ -161,7 +162,7 @@ typedef deque<String>   StrDeq;
 enum LockState { lockNeither, lockTop, lockBottom };
 
 //====================================================================
-// Constants   :##cmd
+// Constants   ##:cmd
 
 const Command  cmmMove        = 0x80;  // Main cmd
 const Command  cmmMoveForward = 0x40;
@@ -180,6 +181,7 @@ const Command  cmfNotCharUp   = 0x01;
 const Command  cmgGoto        = 0x20;  // Main cmd
 const Command  cmgGotoTop     = 0x08;  // Flag
 const Command  cmgGotoBottom  = 0x04;  // Flag
+const Command  cmgGotoLast    = 0x10;
 const Command  cmgGotoForw    = 0x02;
 const Command  cmgGotoBack    = 0x01;
 
@@ -228,7 +230,7 @@ void exitMsg(int status, const char *message);
 void positionInWin(Command cmd, short width, const char *title);
 
 //--------------------------------------------------------------------
-// Help screen text - max 21 lines (minScreenHeight - 3)   :##x
+// Help screen text - max 21 lines (minScreenHeight - 3)   ##:x
 
 const char *aHelp[] = {
 "  ",
@@ -236,7 +238,7 @@ const char *aHelp[] = {
 "  ",
 "  Find:  Find  Next Prev  PgDn PgUp == next/prev diff byte",
 "  ",
-"  Goto:  Goto {dec 0x x %}   + * = | -  ==  skip +4% | -1%",
+"  Goto:  Goto {dec 0x x %}  ' .   + * = | -  ==  +4% | -1%",
 "  ",
 "  Edit file (overwrite),  show Raster,  Ignore case",
 "  Quit/Esc,          any key interrupt the searches",
@@ -257,8 +259,13 @@ const char *aHelp[] = {
 const int longestLine = 58;  // adjust!
 
 const Byte aBold[] = {  // hotkeys, start y:1, x:1
-        4,10, 4,16, 4,21,  6,10, 6,30, 6,32, 6,34, 6,38,  8,3, 8,32, 8,41,
-        9,3,  12,26,  15,23, 15,25, 15,42, 15,44,  16,12, 16,27,'\0' };
+        4,10,  4,16, 4,21,
+        6,10,  6,29, 6,31,  6,35, 6,37, 6,39, 6,43,
+        8,3,  8,32,  8,41,
+        9,3,
+        12,26,
+        15,23, 15,25,  15,42, 15,44,
+        16,12, 16,27,'\0' };
 //--------------------------------------------------------------------
 
 const int helpWidth = 1 + longestLine + 2 + 1;
@@ -322,7 +329,7 @@ inline FPos SeekFile(File file, FPos position, int whence=SEEK_SET)
 }
 
 //====================================================================
-// Class ConWindow   :##win
+// Class ConWindow   ##:win
 
 class ConWindow
 {
@@ -434,7 +441,7 @@ void ConWindow::showCursor(bool insert)
 
  class Difference;
 
-class FileDisplay  // :##file
+class FileDisplay  // ##:file
 {
   friend class Difference;
 
@@ -452,6 +459,7 @@ class FileDisplay  // :##file
   FPos                  offset;
   FPos                  prevOffset;
   FPos                  diffOffset;
+  FPos                  lastOffset;
 
   FPos                 *addr;
   int                   se4rch;
@@ -481,6 +489,8 @@ class FileDisplay  // :##file
   bool          edit(const FileDisplay* other);
   void          setByte(short x, short y, Byte b);
 
+  void          setLast()                               { lastOffset = offset; }
+  void          getLast()                               { FPos tmp = offset; moveTo(lastOffset); lastOffset = tmp; }
   void          skip(bool upwards=false);
   void          sync(const FileDisplay* other);
 
@@ -547,7 +557,7 @@ class InputManager
 }; // end InputManager
 
 //====================================================================
-// Global Variables   :##vars
+// Global Variables   ##:vars
 
 FileDisplay     file1, file2;
 
@@ -597,7 +607,7 @@ void Difference::resizeD()
 }
 
 //--------------------------------------------------------------------
-// Compute differences   :##u
+// Compute differences   ##:u
 
 int Difference::compute(Command cmd)
 {
@@ -747,7 +757,7 @@ void FileDisplay::resizeF()
 }
 
 //--------------------------------------------------------------------
-// Display the file contents   :##disp
+// Display the file contents   ##:disp
 
 void FileDisplay::display()
 {
@@ -931,7 +941,7 @@ void FileDisplay::highEdit(short count)
 }
 
 //--------------------------------------------------------------------
-// Edit the file   :##edit
+// Edit the file   ##:edit
 
 bool FileDisplay::edit(const FileDisplay* other)
 {
@@ -1120,7 +1130,7 @@ void FileDisplay::sync(const FileDisplay* other)
 }
 
 //--------------------------------------------------------------------
-// Change the file position   :##to
+// Change the file position   ##:to
 
 void FileDisplay::moveTo(FPos newOffset)
 {
@@ -1685,7 +1695,7 @@ void setViewMode()
         steps[cmmMoveAll]  = 0;
 }
 
-void calcScreenLayout()  // :##y
+void calcScreenLayout()  // ##:y
 {
         if (COLS < minScreenWidth) {
                 string err("The screen must be at least " + to_string(minScreenWidth) + " characters wide.");
@@ -1865,7 +1875,7 @@ void positionInWin(Command cmd, short width, const char* title)
 }
 
 //--------------------------------------------------------------------
-// Initialize program   :##i
+// Initialize program   ##:i
 
 void initialize()
 {
@@ -1906,7 +1916,7 @@ void initialize()
 } // end initialize
 
 //--------------------------------------------------------------------
-// Get a command from the keyboard   :##get
+// Get a command from the keyboard   ##:get
 
 Command getCommand()
 {
@@ -1936,6 +1946,8 @@ Command getCommand()
                         case '*':
                         case '=':  cmd = cmgGoto | cmgGotoForw; break;
                         case '-':  cmd = cmgGoto | cmgGotoBack; break;
+                        case '\'':
+                        case '.':  cmd = cmgGoto | cmgGotoLast; break;
 
                         case 'T':  if (! singleFile) cmd = cmUseTop; break;
                         case 'B':  if (! singleFile) cmd = cmUseBottom; break;
@@ -1986,7 +1998,7 @@ Command getCommand()
 } // end getCommand
 
 //--------------------------------------------------------------------
-// Get a file position and move there   :##p
+// Get a file position and move there   ##:p
 
 void gotoPosition(Command cmd)
 {
@@ -2032,6 +2044,8 @@ void gotoPosition(Command cmd)
         }
 
         if (cmd & cmgGotoTop) {
+                file1.setLast();
+
                 if (rel) {
                         file1.move(rel > 0 ? pos1 : -pos1);
                 }
@@ -2040,6 +2054,8 @@ void gotoPosition(Command cmd)
                 }
         }
         if (cmd & cmgGotoBottom) {
+                file2.setLast();
+
                 if (rel) {
                         file2.move(rel > 0 ? pos2 : -pos2);
                 }
@@ -2050,7 +2066,7 @@ void gotoPosition(Command cmd)
 } // end gotoPosition
 
 //--------------------------------------------------------------------
-// Search for text or bytes in the files   :##s
+// Search for text or bytes in the files   ##:s
 
 void searchFiles(Command cmd)
 {
@@ -2152,7 +2168,7 @@ void searchFiles(Command cmd)
 } // end searchFiles
 
 //--------------------------------------------------------------------
-// Handle a command   :##hand
+// Handle a command   ##:hand
 
 void handleCmd(Command cmd)
 {
@@ -2167,9 +2183,11 @@ void handleCmd(Command cmd)
 
                 if ((cmd & cmmMoveForward) && ! step) {  // special case first
                         if (cmd & cmgGotoTop) {
+                                file1.setLast();
                                 file1.moveToEnd();
                         }
                         if (cmd & cmgGotoBottom) {
+                                file2.setLast();
                                 file2.moveToEnd();
                         }
                 }
@@ -2179,6 +2197,7 @@ void handleCmd(Command cmd)
                                         file1.move(step);
                                 }
                                 else {
+                                        file1.setLast();
                                         file1.moveTo(0);
                                 }
                         }
@@ -2187,6 +2206,7 @@ void handleCmd(Command cmd)
                                         file2.move(step);
                                 }
                                 else {
+                                        file2.setLast();
                                         file2.moveTo(0);
                                 }
                         }
@@ -2228,7 +2248,15 @@ void handleCmd(Command cmd)
         }
 
         else if (cmd & cmgGoto) {
-                if (cmd & cmgGotoForw) {
+                if (cmd & cmgGotoLast) {
+                        if (cmd & cmgGotoTop) {
+                                file1.getLast();
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                file2.getLast();
+                        }
+                }
+                else if (cmd & cmgGotoForw) {
                         if (cmd & cmgGotoTop) {
                                 file1.skip();
                         }
@@ -2357,7 +2385,7 @@ void handleCmd(Command cmd)
 } // end handleCmd
 
 //====================================================================
-// Main Program   :##main
+// Main Program   ##:main
 
 int main(int argc, const char* argv[])
 {
