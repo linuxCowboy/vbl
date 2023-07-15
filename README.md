@@ -32,7 +32,9 @@ Features:
  - Goto position hex (abcd 0x1234 1234x)
  - Goto position offset (+addr -addr)
  - Goto position history `Up` `Dn`
- - Goto last `'` `.`
+ - Goto last address `'` `<`
+ - Goto last offet `.`
+ - Goto last offet neg `,`
  - Next difference `Enter` (two files)
  - Prev difference `#` `\` (two files)
  - Next different byte `PgDn`
