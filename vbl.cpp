@@ -27,6 +27,7 @@
 //      2.12    ignore case
 //      2.13    relative jumps
 //      2.14    goto back
+//      2.15    repeat offset
 //
 //   This program is free software; you can redistribute it and/or
 //   modify it under the terms of the GNU General Public License as
@@ -54,7 +55,7 @@
 
 using namespace std;
 
-#define VBL_VERSION     "2.14"
+#define VBL_VERSION     "2.15"
 
 /* set Cursor Color in input window: but _REMAINS_ after Exit!
    - set it when curs_set(2) has no effect
@@ -164,13 +165,14 @@ enum LockState { lockNeither, lockTop, lockBottom };
 //====================================================================
 // Constants   ##:cmd
 
-const Command  cmmMove        = 0x80;  // Main cmd
-const Command  cmmMoveForward = 0x40;
-const Command  cmmMoveByte    = 0x00;  // Move 1 byte
-const Command  cmmMoveLine    = 0x01;  // Move 1 line
-const Command  cmmMovePage    = 0x02;  // Move 1 page
-const Command  cmmMoveAll     = 0x03;  // Move to beginning or end
-const Command  cmmMoveSize    = 0x03;  // Mask
+const Command  cmgGoto        = 0x80;  // Main cmd
+const Command  cmgGotoTop     = 0x08;  // Flag
+const Command  cmgGotoBottom  = 0x04;  // Flag
+const Command  cmgGotoNOff    = 0x40;
+const Command  cmgGotoLOff    = 0x20;
+const Command  cmgGotoLast    = 0x10;
+const Command  cmgGotoForw    = 0x02;
+const Command  cmgGotoBack    = 0x01;
 
 const Command  cmfFind        = 0x40;  // Main cmd
 const Command  cmfFindNext    = 0x20;
@@ -178,12 +180,13 @@ const Command  cmfFindPrev    = 0x10;
 const Command  cmfNotCharDn   = 0x02;
 const Command  cmfNotCharUp   = 0x01;
 
-const Command  cmgGoto        = 0x20;  // Main cmd
-const Command  cmgGotoTop     = 0x08;  // Flag
-const Command  cmgGotoBottom  = 0x04;  // Flag
-const Command  cmgGotoLast    = 0x10;
-const Command  cmgGotoForw    = 0x02;
-const Command  cmgGotoBack    = 0x01;
+const Command  cmmMove        = 0x20;  // Main cmd
+const Command  cmmMoveForward = 0x10;
+const Command  cmmMoveByte    = 0x00;  // Move 1 byte
+const Command  cmmMoveLine    = 0x01;  // Move 1 line
+const Command  cmmMovePage    = 0x02;  // Move 1 page
+const Command  cmmMoveAll     = 0x03;  // Move to beginning or end
+const Command  cmmMoveSize    = 0x03;  // Mask
 
 const Command  cmNothing      = 0;
 const Command  cmUseTop       = 1;
@@ -234,38 +237,39 @@ void positionInWin(Command cmd, short width, const char *title);
 
 const char *aHelp[] = {
 "  ",
-"  Move:  arrows  home end  space backspace",
+"  Move:  left right up down   home end    space backspace",
 "  ",
-"  Find:  Find  Next Prev  PgDn PgUp == next/prev diff byte",
+"  Find   Next Prev       PgDn PgUp == next/prev diff byte",
 "  ",
-"  Goto:  Goto {dec 0x x %}  ' .   + * = | -  ==  +4% | -1%",
+"  Goto [+-]{dec 0x x %}  last ' <  . ,   +4% + * =  -1% -",
 "  ",
-"  Edit file (overwrite),  show Raster,  Ignore case",
-"  Quit/Esc,          any key interrupt the searches",
+"  Edit file (overwrite),     show Raster,     Ignore case",
+"  Quit/Esc,                any key interrupt the searches",
 "  ",
 "                      --- One File ---",
 "  Enter == sm4rtscroll   Ascii mode",
 "  ",
 "                      --- Two Files ---",
-"  Enter == next diff  # \\ == prev diff   1 2 == sync views",
-"  use only Top,  use only Bottom",
+"  Enter == next diff  # \\ == prev diff  1 2 == sync views",
+"                           use only Top,  use only Bottom",
 "  ",
 "                      --- Edit ---",
-"  Enter == copy byte from other file;  Insert  Ctrl-U",
-"  Tab  ==  HEX <> ASCII, Esc == done;  Delete  Ctrl-K",
+"  Enter == copy byte from other file;     Insert   Ctrl-U",
+"  Tab  ==  HEX <> ASCII, Esc == done;     Delete   Ctrl-K",
 "  "
 };
 
-const int longestLine = 58;  // adjust!
+const int longestLine = 57;  // adjust!
 
 const Byte aBold[] = {  // hotkeys, start y:1, x:1
-        4,10,  4,16, 4,21,
-        6,10,  6,29, 6,31,  6,35, 6,37, 6,39, 6,43,
-        8,3,  8,32,  8,41,
+        4,3,  4,10, 4,15,
+        6,3,  6,31, 6,33,  6,36, 6,38,  6,46, 6,48, 6,50,  6,57,
+        8,3,  8,35,  8,47,
         9,3,
         12,26,
-        15,23, 15,25,  15,42, 15,44,
-        16,12, 16,27,'\0' };
+        15,23, 15,25,  15,41, 15,43,
+        16,37, 16,52,
+        '\0' };
 //--------------------------------------------------------------------
 
 const int helpWidth = 1 + longestLine + 2 + 1;
@@ -468,6 +472,7 @@ class FileDisplay  // ##:file
   FPos                  filesize;
   FPos                  searchOff;
   FPos                  scrollOff;
+  FPos                  repeatOff;
   bool                  advance;
   bool                  two;
 
@@ -1947,7 +1952,9 @@ Command getCommand()
                         case '=':  cmd = cmgGoto | cmgGotoForw; break;
                         case '-':  cmd = cmgGoto | cmgGotoBack; break;
                         case '\'':
-                        case '.':  cmd = cmgGoto | cmgGotoLast; break;
+                        case '<':  cmd = cmgGoto | cmgGotoLast; break;
+                        case '.':  cmd = cmgGoto | cmgGotoLOff; break;
+                        case ',':  cmd = cmgGoto | cmgGotoNOff; break;
 
                         case 'T':  if (! singleFile) cmd = cmUseTop; break;
                         case 'B':  if (! singleFile) cmd = cmUseBottom; break;
@@ -2047,7 +2054,8 @@ void gotoPosition(Command cmd)
                 file1.setLast();
 
                 if (rel) {
-                        file1.move(rel > 0 ? pos1 : -pos1);
+                        file1.repeatOff = rel > 0 ? pos1 : -pos1;
+                        file1.move(file1.repeatOff);
                 }
                 else {
                         file1.moveTo(pos1);
@@ -2057,7 +2065,8 @@ void gotoPosition(Command cmd)
                 file2.setLast();
 
                 if (rel) {
-                        file2.move(rel > 0 ? pos2 : -pos2);
+                        file2.repeatOff = rel > 0 ? pos2 : -pos2;
+                        file2.move(file2.repeatOff);
                 }
                 else {
                         file2.moveTo(pos2);
@@ -2174,42 +2183,49 @@ void handleCmd(Command cmd)
 {
         stopRead = false;
 
-        if (cmd & cmmMove) {
-                int step = steps[cmd & cmmMoveSize];
-
-                if (! (cmd & cmmMoveForward)) {
-                        step *= -1;
-                }
-
-                if ((cmd & cmmMoveForward) && ! step) {  // special case first
+        if (cmd & cmgGoto) {
+                if (cmd & cmgGotoNOff) {
                         if (cmd & cmgGotoTop) {
-                                file1.setLast();
-                                file1.moveToEnd();
+                                file1.move(-file1.repeatOff);
                         }
                         if (cmd & cmgGotoBottom) {
-                                file2.setLast();
-                                file2.moveToEnd();
+                                file2.move(-file2.repeatOff);
+                        }
+                }
+                else if (cmd & cmgGotoLOff) {
+                        if (cmd & cmgGotoTop) {
+                                file1.move(file1.repeatOff);
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                file2.move(file2.repeatOff);
+                        }
+                }
+                else if (cmd & cmgGotoLast) {
+                        if (cmd & cmgGotoTop) {
+                                file1.getLast();
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                file2.getLast();
+                        }
+                }
+                else if (cmd & cmgGotoForw) {
+                        if (cmd & cmgGotoTop) {
+                                file1.skip();
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                file2.skip();
+                        }
+                }
+                else if (cmd & cmgGotoBack) {
+                        if (cmd & cmgGotoTop) {
+                                file1.skip(true);
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                file2.skip(true);
                         }
                 }
                 else {
-                        if (cmd & cmgGotoTop) {
-                                if (step) {
-                                        file1.move(step);
-                                }
-                                else {
-                                        file1.setLast();
-                                        file1.moveTo(0);
-                                }
-                        }
-                        if (cmd & cmgGotoBottom) {
-                                if (step) {
-                                        file2.move(step);
-                                }
-                                else {
-                                        file2.setLast();
-                                        file2.moveTo(0);
-                                }
-                        }
+                        gotoPosition(cmd);
                 }
         }
 
@@ -2247,33 +2263,42 @@ void handleCmd(Command cmd)
                 }
         }
 
-        else if (cmd & cmgGoto) {
-                if (cmd & cmgGotoLast) {
-                        if (cmd & cmgGotoTop) {
-                                file1.getLast();
-                        }
-                        if (cmd & cmgGotoBottom) {
-                                file2.getLast();
-                        }
+        else if (cmd & cmmMove) {
+                int step = steps[cmd & cmmMoveSize];
+
+                if (! (cmd & cmmMoveForward)) {
+                        step *= -1;
                 }
-                else if (cmd & cmgGotoForw) {
+
+                if ((cmd & cmmMoveForward) && ! step) {  // special case first
                         if (cmd & cmgGotoTop) {
-                                file1.skip();
+                                file1.setLast();
+                                file1.moveToEnd();
                         }
                         if (cmd & cmgGotoBottom) {
-                                file2.skip();
-                        }
-                }
-                else if (cmd & cmgGotoBack) {
-                        if (cmd & cmgGotoTop) {
-                                file1.skip(true);
-                        }
-                        if (cmd & cmgGotoBottom) {
-                                file2.skip(true);
+                                file2.setLast();
+                                file2.moveToEnd();
                         }
                 }
                 else {
-                        gotoPosition(cmd);
+                        if (cmd & cmgGotoTop) {
+                                if (step) {
+                                        file1.move(step);
+                                }
+                                else {
+                                        file1.setLast();
+                                        file1.moveTo(0);
+                                }
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                if (step) {
+                                        file2.move(step);
+                                }
+                                else {
+                                        file2.setLast();
+                                        file2.moveTo(0);
+                                }
+                        }
                 }
         }
 
