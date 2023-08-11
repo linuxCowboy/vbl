@@ -28,6 +28,7 @@
 //      2.13    relative jumps
 //      2.14    goto back
 //      2.15    repeat offset
+//      2.16    seekNotChar ascii
 //
 //   This program is free software; you can redistribute it and/or
 //   modify it under the terms of the GNU General Public License as
@@ -55,7 +56,7 @@
 
 using namespace std;
 
-#define VBL_VERSION     "2.15"
+#define VBL_VERSION     "2.16"
 
 /* set Cursor Color in input window: but _REMAINS_ after Exit!
    - set it when curs_set(2) has no effect
@@ -1270,24 +1271,31 @@ void FileDisplay::seekNotChar(bool upwards)
 
         const int blockSize = 1024 * 1024;
         Byte *const searchBuf = new Byte[blockSize];
-        const Byte searchFor = *dataF;
+
+        Byte searchFor = *dataF;
+        if (modeAscii && ! isprint(searchFor)) { searchFor = ' '; }
+
         FPos newPos = upwards ? offset - blockSize : offset + 1;
         int bytesRead;
-        int diff = 0;
+        int diff = 0, here = -1;
 
         for (;;) {
                 if (newPos < 0) { diff = newPos; newPos = 0; }
                 SeekFile(fd, newPos);
                 if (((bytesRead = ReadFile(fd, searchBuf, blockSize)) <= 0) || stopRead) break;
 
+                if (modeAscii) {
+                        for (int i=0; i < bytesRead; ++i) {
+                                if (! ((unsigned) searchBuf[i] - ' ' < '_')) {
+                                        searchBuf[i] = ' ';
+                                }
+                        }
+                }
+
                 if (upwards) {
                         for (int i = blockSize - 1 + diff; i >= 0; --i) {
                                 if (searchBuf[i] != searchFor) {
-                                        delete [] searchBuf;
-                                        if (newPos + i >= steps[cmmMovePage])
-                                                moveTo(newPos + i - steps[cmmMovePage]);
-                                        else moveTo(newPos + i);
-                                        se4rch = 1; return;
+                                        here = i; goto done;
                                 }
                         }
                         if (! newPos) break;
@@ -1296,18 +1304,18 @@ void FileDisplay::seekNotChar(bool upwards)
                 else {
                         for (int i=0; i < bytesRead; ++i) {
                                 if (searchBuf[i] != searchFor) {
-                                        delete [] searchBuf;
-                                        moveTo(newPos + i);
-                                        se4rch = 1; return;
+                                        here = i; goto done;
                                 }
                         }
                         newPos += blockSize;
                 }
         }
+done:
         delete [] searchBuf;
-        if      (stopRead) { moveTo(newPos); }
-        else if (upwards)  { moveTo(0); }
-        else               { moveToEnd(); }
+        if      (here >= 0) { moveTo(newPos + here); se4rch = 1; }
+        else if (stopRead)  { moveTo(newPos); }
+        else if (upwards)   { moveTo(0); }
+        else                { moveToEnd(); }
 } // end FileDisplay::seekNotChar
 
 //--------------------------------------------------------------------
