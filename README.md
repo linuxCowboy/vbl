@@ -1,13 +1,13 @@
 vbl - VBindiff for Linux
 ========================
 
-Hex viewer and differ
-
-For you Linuxer!
+Hex viewer, differ and editor
 
 dynamic 16/24/32 byte Hex & ASCII view in a terminal
 
 256TB Files
+
+edit / insert / delete
 
 64-bit static + dynamic
 
@@ -25,22 +25,26 @@ Features:
  - Search edit `Ins` `Del` `^u` `^k`
  - Search highlight
  - Search indentation
- - Search interruption `ANY`
+ - Search interruption `Esc`
  - Visual feedback
  - Goto position decimal `g`
  - Goto position percent
  - Goto position hex (abcd 0x1234 1234x)
+ - Goto position 10** (kmgt)
+ - Goto position 2** (KMGT)
  - Goto position offset (+addr -addr)
  - Goto position history `Up` `Dn`
  - Goto last address `'` `<`
- - Goto last offet `.`
- - Goto last offet neg `,`
- - Next difference `Enter` (two files)
- - Prev difference `#` `\` (two files)
+ - Goto last offset `.`
+ - Goto last offset neg `,`
+ - Set  last address `l`
+ - Set  last address auto `g` `f` `Home` `End`
+ - Next difference `Enter`
+ - Prev difference `#` `\`
  - Next different byte `PgDn`
  - Prev different byte `PgUp`
- - Sync 1. with 2. view `1` (two files)
- - Sync 2. with 1. view `2` (two files)
+ - Sync 1. with 2. view `1`
+ - Sync 2. with 1. view `2`
  - File position decimal
  - File position percent
  - File offset difference
@@ -49,12 +53,32 @@ Features:
  - Skip backward 1% `-`
  - ASCII-Mode (single mode) `a`
  - Column raster `r`
- - Edit file (overwrite) `e`
+ - Edit file `e`
+ - Edit insert byte `Ins`
+ - Edit delete byte `Del`
  - RW/RO detection
  - Use only top file `t`
  - Use only bottom file `b`
  - Help window `h`
- - Quit `q` `Esc`
+ - Quit `q`
+ - Easter egg
+
+Notes:
+------
+
+All operations take place in read-only mode.
+
+Only if you _exit_ the edit mode and there are changes and you _explicitly_ confirm this will the file be temporarily opened for read/write.
+
+With inserted or deleted bytes, the write can be huge, so it happens always **in place**.
+
+The _last address_ is auto set with initial `Find`, `Goto` w/o relative, `home`/`end` or manual with `l`.
+
+New _TurboSearch_ for SSD: but avoid a leading null byte when searching in massive empty space!
+
+Only `Esc` interrupt the searches.
+
+Only `q` quit the program.
 
 Build:
 ------
@@ -91,5 +115,9 @@ Screenshoots:
 ![Screenshot](pics/two.jpg)
 *Two Files*
 
+![Screenshot](pics/ask.png)
+*You have to confirm long writes (>512MB)*
+
 ![Screenshot](pics/help.png)
 *Help Screen*
+
