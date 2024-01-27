@@ -2,13 +2,13 @@
 //
 //   VBinDiff for Linux
 //
-//   Copyright 1995-2017 by Christopher J. Madsen
-//   Copyright 2021-2023 by linuxCowboy
+//   Hex viewer, differ and editor
 //
-//   64GB by Bradley Grainger
-//   dynamic width by Christophe Bucher
+//   Copyright 2021-2024 by linuxCowboy
 //
-//   Visual display of differences in binary files
+//   vbindiff       by Christopher J. Madsen
+//   64GB           by Bradley Grainger
+//   dynamic width  by Christophe Bucher
 //
 //   Version:
 //      1.x     classic vbindiff interface, fix 32 byte
@@ -29,6 +29,14 @@
 //      2.14    goto back
 //      2.15    repeat offset
 //      2.16    seekNotChar ascii
+//      ---- meanwhile almost completely rewritten ----
+//      3.0     edit insert/delete
+//      3.1     InputManager
+//      3.2     progress bar
+//      3.3     goto prefix
+//      3.4     edit diff
+//      3.5     set last
+//      3.6     golf search
 //
 //   This program is free software; you can redistribute it and/or
 //   modify it under the terms of the GNU General Public License as
@@ -40,14 +48,14 @@
 //   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 //   GNU General Public License for more details.
 //
-//   You should have received a copy of the GNU General Public License
-//   along with this program.  If not, see <https://www.gnu.org/licenses/>.
-//--------------------------------------------------------------------
+//   For the GNU General Public License see <https://www.gnu.org/licenses/>.
+//--------------------------------------------------------------------------
 
-#include <limits.h>
 #include <string.h>
-#include <fcntl.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <err.h>
 
 #include <string>
 #include <deque>
@@ -56,10 +64,12 @@
 
 using namespace std;
 
-#define VBL_VERSION     "2.16"
+#define VBL_VERSION     "3.6"
 
-/* set Cursor Color in input window: but _REMAINS_ after Exit!
+/* set Cursor Color in input window:
    - set it when curs_set(2) has no effect
+
+   - uses OSC (Operating System Command)
 
    - cmdline override:
         meson setup [--wipe] -Dcpp_args=-DSET_CURSOR_COLOR=0|1 vbl
@@ -70,171 +80,200 @@ using namespace std;
 #define SET_CURSOR_COLOR        0
 #endif
 
-/* curses debug: vbl file 2>/tmp/.vbl; cat /tmp/.vbl */
-#define mPi(x)          fprintf(stderr, "%s: %ld 0x%lX \n", #x, (long unsigned int) x, (long unsigned int) x);
-#define mPs(x)          fprintf(stderr, "%s: %s \n", #x, x);
+/* show a summary in edit insert/delete after large writes */
+#ifndef SHOW_WRITE_SUMMARY
+#define SHOW_WRITE_SUMMARY      0
+#endif
+
+bool debug = 1;
+/* curses debug:
+f=/tmp/.vbl
+tail -F $f
+vbl file 2>$f; cat $f
+*/
+#define mPI(x)          if (debug) fprintf(stderr, "\r%s: %ld 0x%lX \n",  #x, (long)  x,         (long) x);
+#define mPU(x)          if (debug) fprintf(stderr, "\r%s: %ld 0x%lX \n",  #x, (Full)  x,         (Full) x);
+/* profiling: ns */
+#define mPF(x)          if (debug) fprintf(stderr, "\r%s: %.3f 0x%lX \n", #x, (float) x/1000000, (Full) x);
+#define mPS(x)          if (debug) fprintf(stderr, "\r%s: %s \n",         #x,         x);
+/* hex dump: pointer, count */
+#define mPX(x, c)       if (debug) fprintf(stderr, "\r%s, %d \n\r",       #x, (int)   c);\
+                                   for (Word i=0; i < c; ++i) fprintf(stderr, "%X ", x[i]);\
+                                   fprintf(stderr, "\n");
+/* w/o redirection */
+#define mPP(x)          if (debug) sleep(x);
+#define mPK             if (debug) file1.readKeyF();
+
+#define mEdit           historyPos = history.size();
+#define mScale          count   / (scale ? scale : 1)
+#define mScaleInc       count++ / (scale ? scale : 1)
 
 #define KEY_CTRL_C      0x03
 #define KEY_TAB         0x09
+#define KEY_CTRL_K      0x0B
 #define KEY_RETURN      0x0D
+#define KEY_CTRL_U      0x15
 #define KEY_ESCAPE      0x1B
 #define KEY_DELETE      0x7F
 
-enum Style {
-  cBackground,
-  cWindow,
-  cWindowBold,
-  cCurrentMode,
-  cFileName,
-  cFileWin,
-  cFileDiff,
-  cFileEdit,
-  cFileSearch,
-  cFileMark,
-  cFileAddr,
-  cHotKey,
-  cHighFile,
-  cHighBusy,
-  cHighEdit
-};
+//====================================================================
+// Color Enumerations
 
 enum ColorPair {
-  pairWhiteBlue = 1,
-  pairWhiteBlack,
-  pairRedWhite,
-  pairYellowBlue,
-  pairGreenBlue,
-  pairBlackCyan,
-  pairGreenBlack,
-  pairWhiteCyan,
-  pairWhiteRed,
-  pairBlackYellow
+        pairWhiteBlue = 1,
+        pairBlackWhite,
+        pairRedWhite,
+        pairYellowBlue,
+        pairGreenBlue,
+        pairBlackCyan,
+        pairGreenBlack,
+        pairWhiteCyan,
+        pairWhiteRed,
+        pairBlackYellow
+};
+
+enum Style {
+        cMainWin,
+        cInputWin,
+        cHelpWin,
+        cName,
+        cDiff,
+        cEdit,
+        cInsert,
+        cSearch,
+        cRaster,
+        cAddress,
+        cHotkey,
+        cHighFile,
+        cHighBusy,
+        cHighEdit
 };
 
 static const ColorPair colorStyle[] = {
-  pairWhiteBlue,   // cBackground
-  pairWhiteBlue,   // cWindow
-  pairWhiteBlue,   // cWindowBold
-  pairWhiteBlack,  // cCurrentMode
-  pairWhiteBlack,  // cFileName
-  pairWhiteBlue,   // cFileWin
-  pairGreenBlack,  // cFileDiff
-  pairYellowBlue,  // cFileEdit
-  pairRedWhite,    // cFileSearch
-  pairBlackCyan,   // cFileMark
-  pairYellowBlue,  // cFileAddr
-  pairGreenBlue,   // cHotKey
-  pairWhiteCyan,   // cHighFile
-  pairWhiteRed,    // cHighBusy
-  pairBlackYellow  // cHighEdit
+        pairWhiteBlue,   // cMainWin
+        pairWhiteBlue,   // cInputWin
+        pairWhiteBlue,   // cHelpWin
+        pairBlackWhite,  // cName
+        pairGreenBlack,  // cDiff
+        pairYellowBlue,  // cEdit
+        pairGreenBlue,   // cInsert
+        pairRedWhite,    // cSearch
+        pairBlackCyan,   // cRaster
+        pairYellowBlue,  // cAddress
+        pairGreenBlue,   // cHotkey
+        pairWhiteCyan,   // cHighFile
+        pairWhiteRed,    // cHighBusy
+        pairBlackYellow  // cHighEdit
 };
 
 static const attr_t attribStyle[] = {
-              COLOR_PAIR(colorStyle[ cBackground ]),
-              COLOR_PAIR(colorStyle[ cWindow     ]),
-  A_BOLD    | COLOR_PAIR(colorStyle[ cWindowBold ]),
-  A_REVERSE | COLOR_PAIR(colorStyle[ cCurrentMode]),
-  A_REVERSE | COLOR_PAIR(colorStyle[ cFileName   ]),
-              COLOR_PAIR(colorStyle[ cFileWin    ]),
-  A_BOLD    | COLOR_PAIR(colorStyle[ cFileDiff   ]),
-  A_BOLD    | COLOR_PAIR(colorStyle[ cFileEdit   ]),
-              COLOR_PAIR(colorStyle[ cFileSearch ]),
-              COLOR_PAIR(colorStyle[ cFileMark   ]),
-  A_BOLD    | COLOR_PAIR(colorStyle[ cFileAddr   ]),
-  A_BOLD    | COLOR_PAIR(colorStyle[ cHotKey     ]),
-  A_BOLD    | COLOR_PAIR(colorStyle[ cHighFile   ]),
-              COLOR_PAIR(colorStyle[ cHighBusy   ]),
-              COLOR_PAIR(colorStyle[ cHighEdit   ])
+                    COLOR_PAIR(colorStyle[ cMainWin  ]),
+        A_BOLD    | COLOR_PAIR(colorStyle[ cInputWin ]),
+        A_BOLD    | COLOR_PAIR(colorStyle[ cHelpWin  ]),
+                    COLOR_PAIR(colorStyle[ cName     ]),
+        A_BOLD    | COLOR_PAIR(colorStyle[ cDiff     ]),
+        A_BOLD    | COLOR_PAIR(colorStyle[ cEdit     ]),
+        A_BOLD    | COLOR_PAIR(colorStyle[ cInsert   ]),
+                    COLOR_PAIR(colorStyle[ cSearch   ]),
+                    COLOR_PAIR(colorStyle[ cRaster   ]),
+        A_BOLD    | COLOR_PAIR(colorStyle[ cAddress  ]),
+        A_BOLD    | COLOR_PAIR(colorStyle[ cHotkey   ]),
+        A_BOLD    | COLOR_PAIR(colorStyle[ cHighFile ]),
+        A_BOLD    | COLOR_PAIR(colorStyle[ cHighBusy ]),
+                    COLOR_PAIR(colorStyle[ cHighEdit ])
 };
 
 //====================================================================
 // Type definitions
 
 typedef unsigned char   Byte;
+typedef unsigned short  Word;
+typedef unsigned int    Half;
+typedef unsigned long   Full;
 typedef Byte            Command;
 
 typedef int             File;
 typedef off_t           FPos;  // long int
 typedef ssize_t         Size;  // long int
-  // typedef long unsigned int size_t;
 
-typedef string          String;
-typedef deque<String>   StrDeq;
+typedef deque<string>   StrDeq;
+typedef deque<Byte>     BytDeq;
 
 enum LockState { lockNeither, lockTop, lockBottom };
 
 //====================================================================
-// Constants   ##:cmd
+// Constants  ##:cmd
 
-const Command  cmgGoto        = 0x80;  // Main cmd
-const Command  cmgGotoTop     = 0x08;  // Flag
-const Command  cmgGotoBottom  = 0x04;  // Flag
-const Command  cmgGotoNOff    = 0x40;
-const Command  cmgGotoLOff    = 0x20;
-const Command  cmgGotoLast    = 0x10;
-const Command  cmgGotoForw    = 0x02;
-const Command  cmgGotoBack    = 0x01;
+const Command   cmgGoto        = 0x80;  // Main cmd
+const Command   cmgGotoTop     = 0x08;  // Flag
+const Command   cmgGotoBottom  = 0x04;  // Flag
+const Command   cmgGotoForw    = 0x40;
+const Command   cmgGotoBack    = 0x20;
+const Command   cmgGotoLSet    = 0x10;
+const Command   cmgGotoLGet    = 0x01;
+const Command   cmgGotoLOff    = 0x02;
+const Command   cmgGotoNOff    = 0x03;
+const Command   cmgGotoMask    = 0x03;
 
-const Command  cmfFind        = 0x40;  // Main cmd
-const Command  cmfFindNext    = 0x20;
-const Command  cmfFindPrev    = 0x10;
-const Command  cmfNotCharDn   = 0x02;
-const Command  cmfNotCharUp   = 0x01;
+const Command   cmfFind        = 0x40;  // Main cmd
+const Command   cmfFindNext    = 0x20;
+const Command   cmfFindPrev    = 0x10;
+const Command   cmfNotCharDn   = 0x02;
+const Command   cmfNotCharUp   = 0x01;
 
-const Command  cmmMove        = 0x20;  // Main cmd
-const Command  cmmMoveForward = 0x10;
-const Command  cmmMoveByte    = 0x00;  // Move 1 byte
-const Command  cmmMoveLine    = 0x01;  // Move 1 line
-const Command  cmmMovePage    = 0x02;  // Move 1 page
-const Command  cmmMoveAll     = 0x03;  // Move to beginning or end
-const Command  cmmMoveSize    = 0x03;  // Mask
+const Command   cmmMove        = 0x20;  // Main cmd
+const Command   cmmMoveForward = 0x10;
+const Command   cmmMoveByte    = 0x00;  // Move 1 byte
+const Command   cmmMoveLine    = 0x01;  // Move 1 line
+const Command   cmmMovePage    = 0x02;  // Move 1 page
+const Command   cmmMoveAll     = 0x03;  // Move to begin or end
+const Command   cmmMoveMask    = 0x03;
 
-const Command  cmNothing      = 0;
-const Command  cmUseTop       = 1;
-const Command  cmUseBottom    = 2;
-const Command  cmNextDiff     = 3;
-const Command  cmPrevDiff     = 4;
-const Command  cmEditTop      = 5;
-const Command  cmEditBottom   = 6;
-const Command  cmSyncUp       = 7;
-const Command  cmSyncDn       = 8;
-const Command  cmShowAscii    = 9;
-const Command  cmIgnoreCase   = 10;
-const Command  cmShowRaster   = 11;
-const Command  cmShowHelp     = 12;
-const Command  cmSmartScroll  = 13;
-const Command  cmQuit         = 14;
-
-//--------------------------------------------------------------------
-
-const int minScreenHeight = 24;  // Enforced minimum height
-const int minScreenWidth  = 79;  // Enforced minimum width
-
-const int skipForw = 4;  // Percent to skip forward
-const int skipBack = 1;  // Percent to skip backward
-
-const int maxPath = 2000;
-const int sizeReadBuf = 0x1000000;  // speedup compute()
-
-const int maxHistory = 50;
-
-const char hexDigits[] = "0123456789ABCDEF%X+-";  // with Goto %, hex and rel
-
-const char thouSep = '.';  // thousands separator (or '\0')
-
-const File InvalidFile = -1;
-
-const char colorInsert[] = "#00BBBB";  // cursor color "normal"
-const char colorDelete[] = "#EE0000";  // cursor color "very visible"
-
-int safeUC(int key);
-void lowerCase(Byte *buf, int len);
-char *pretty(char *buffer, FPos *size, int sign);
-void exitMsg(int status, const char *message);
-void positionInWin(Command cmd, short width, const char *title);
+const Command   cmNothing      =  0;
+const Command   cmUseTop       =  1;
+const Command   cmUseBottom    =  2;
+const Command   cmNextDiff     =  3;
+const Command   cmPrevDiff     =  4;
+const Command   cmEditTop      =  5;
+const Command   cmEditBottom   =  6;
+const Command   cmSyncUp       =  7;
+const Command   cmSyncDn       =  8;
+const Command   cmShowAscii    =  9;
+const Command   cmIgnoreCase   = 10;
+const Command   cmShowRaster   = 11;
+const Command   cmShowHelp     = 12;
+const Command   cmSmartScroll  = 13;
+const Command   cmQuit         = 14;
 
 //--------------------------------------------------------------------
-// Help screen text - max 21 lines (minScreenHeight - 3)   ##:x
+
+const Size minScreenHeight = 24,  // Enforced minimum height
+           minScreenWidth  = 79,  // Enforced minimum width
+
+           skipForw = 4,  // Percent to skip forward
+           skipBack = 1,  // Percent to skip backward
+
+           staticSize = 1 << 24,  // size global buffers
+           warnResize = 1 << 29,  // confirmation threshold
+
+           maxHistory = 20;
+
+const char *hexDigits     = "0123456789ABCDEF",                     // search
+           *hexDigitsGoto = "0123456789ABCDEFabcdef%Xx+-kmgtKMGT",  // goto
+
+           thouSep = ',',  // thousands separator (or '\0')
+
+           *colorInsert = "#00BBBB",  // cursor color "normal"
+           *colorDelete = "#EE0000";  // cursor color "very visible"
+
+const wchar_t barSyms[] = {L'▏', L'▎', L'▍', L'▌', L'▋', L'▊', L'▉', L'█'};
+
+const char sPrefix[] = "kmgtKMGT";
+const Size aPrefix[] = { 1000, 1000000, 1000000000, 1000000000000,
+                         1024, 1048576, 1073741824, 1099511627776 };
+
+//--------------------------------------------------------------------
+// Help screen text - max 21 lines (minScreenHeight - 3)  ##:x
 
 const char *aHelp[] = {
 "  ",
@@ -242,17 +281,17 @@ const char *aHelp[] = {
 "  ",
 "  Find   Next Prev       PgDn PgUp == next/prev diff byte",
 "  ",
-"  Goto [+-]{dec 0x x %}  last ' <  . ,   +4% + * =  -1% -",
+"  Goto [+-]{dec hex 0x x$}[%|kmgtKMGT]   +4% + * =  -1% -",
+"   last addr: get ' <  set l  last offset .  neg offset ,",
 "  ",
-"  Edit file (overwrite),     show Raster,     Ignore case",
-"  Quit/Esc,                any key interrupt the searches",
+"  Edit file   show Raster   Ignore case              Quit",
 "  ",
 "                      --- One File ---",
 "  Enter == sm4rtscroll   Ascii mode",
 "  ",
 "                      --- Two Files ---",
 "  Enter == next diff  # \\ == prev diff  1 2 == sync views",
-"                           use only Top,  use only Bottom",
+"                      use only Top,  use only Bottom",
 "  ",
 "                      --- Edit ---",
 "  Enter == copy byte from other file;     Insert   Ctrl-U",
@@ -264,159 +303,414 @@ const int longestLine = 57;  // adjust!
 
 const Byte aBold[] = {  // hotkeys, start y:1, x:1
         4,3,  4,10, 4,15,
-        6,3,  6,31, 6,33,  6,36, 6,38,  6,46, 6,48, 6,50,  6,57,
-        8,3,  8,35,  8,47,
-        9,3,
+        6,3,  6,46, 6,48, 6,50,  6,57,
+        7,19, 7,21,  7,28,  7,43,  7,57,
+        9,3,  9,20,  9,29,  9,54,
         12,26,
         15,23, 15,25,  15,41, 15,43,
-        16,37, 16,52,
-        '\0' };
-//--------------------------------------------------------------------
+        16,32, 16,47,
+        0
+};
 
-const int helpWidth = 1 + longestLine + 2 + 1;
-const int helpHeight = 1 + sizeof(aHelp) / sizeof(aHelp[0]) + 1;
+const char *helpVersion = " VBinDiff for Linux " VBL_VERSION " ";
+
+const int helpWidth  = 1 + longestLine + 2                  + 1,
+          helpHeight = 1 + sizeof(aHelp) / sizeof(aHelp[0]) + 1;
 
 //====================================================================
+// Global Variables  ##:vars
+
+WINDOW *winInput,
+       *winHelp;
+
+alignas(0x100000)
+Byte bufFile1[staticSize],
+     bufFile2[staticSize];
+
+Byte *buffer = bufFile1;
+
+char bufTimer[64];
+
+bool singleFile,
+     showRaster,
+     sizeTera,
+     modeAscii,
+     ignoreCase,
+     stopRead;
+
+int haveDiff;
+
+LockState lockState;
+
+string lastSearch,
+       lastSearchIgnCase;
+
+StrDeq hexSearchHistory,
+       textSearchHistory,
+       positionHistory;
+
+BytDeq editBytes,
+       editColor;
+
+// Set dynamically for 16/24/32 byte width
+int screenWidth,   // Number of columns in curses
+    linesTotal,    // Number of lines in curses
+    numLines,      // Number of lines of each file to display
+    bufSize,       // Number of bytes of each file to display
+    lineWidth,     // Number of bytes displayed per line
+    lineWidthAsc,  // Number of bytes displayed per line ascii
+    inWidth,       // Number of digits in input window
+    leftMar,       // Starting column of hex display
+    leftMar2,      // Starting column of ASCII display
+    searchIndent,  // Lines of search result indentation
+    steps[4];      // Number of bytes to move for each step
+
+//====================================================================
+// Global Functions
+
+//--------------------------------------------------------------------
 // FileIO
 
-bool stopRead;
-
-inline File OpenFile(const char* path, bool writable=false)
+File OpenFile(const char* path, bool writable=false)
 {
-  return open(path, (writable ? O_RDWR : O_RDONLY));
+        return open(path, (writable ? O_RDWR : O_RDONLY));
 }
 
-inline void CloseFile(File file)
+bool WriteFile(File file, const Byte* buf, Size cnt)
 {
-  close(file);
+        while (cnt > 0) {
+                Size bytesWritten = write(file, buf, cnt);
+
+                if (bytesWritten < 1) {
+                        if (errno == EINTR)
+                                bytesWritten = 0;
+                        else
+                                return false;
+                }
+
+                buf += bytesWritten;
+                cnt -= bytesWritten;
+        }
+
+        return true;
 }
 
-bool WriteFile(File file, const void* buffer, Size count)
+Size ReadFile(File file, Byte* buf, Size cnt)
 {
-  const char* ptr = reinterpret_cast<const char*>(buffer);
-
-  while (count > 0) {
-    Size bytesWritten = write(file, ptr, count);
-    if (bytesWritten < 1) {
-      if (errno == EINTR)
-        bytesWritten = 0;
-      else
-        return false;
-    }
-
-    ptr   += bytesWritten;
-    count -= bytesWritten;
-  } // end while more to write
-
-  return true;
-} // end WriteFile
-
-inline int ReadFile(File file, void* buffer, Size count)
-{
-        int ret = read(file, buffer, count);
+        Size ret = read(file, buf, cnt);
 
         /* interrupt the searches */
         timeout(0);
         switch(getch()) {
-                case ERR:
-                case KEY_UP:  // scrollwheel
-                case KEY_DOWN:  break;
-                default:  stopRead = true;
+                case KEY_ESCAPE:
+                        stopRead = true;
         }
         timeout(-1);
 
         return ret;
 }
 
-inline FPos SeekFile(File file, FPos position, int whence=SEEK_SET)
+FPos SeekFile(File file, FPos position, int whence=SEEK_SET)
 {
-  return lseek(file, position, whence);
+        return lseek(file, position, whence);
+}
+
+//--------------------------------------------------------------------
+// Initialize ncurses  ##:i
+
+bool initialize()
+{
+        setlocale(LC_ALL, "");  // for Unicode blocks
+
+        if (! initscr()) {
+                return false;
+        }
+
+        set_escdelay(10);
+        keypad(stdscr, true);
+
+        nonl();
+        cbreak();
+        noecho();
+
+        if (has_colors()) {
+                start_color();
+
+                init_pair(pairWhiteBlue,   COLOR_WHITE,  COLOR_BLUE);
+                init_pair(pairBlackWhite,  COLOR_BLACK,  COLOR_WHITE);
+                init_pair(pairRedWhite,    COLOR_RED,    COLOR_WHITE);
+                init_pair(pairYellowBlue,  COLOR_YELLOW, COLOR_BLUE);
+                init_pair(pairGreenBlue,   COLOR_GREEN,  COLOR_BLUE);
+                init_pair(pairBlackCyan,   COLOR_BLACK,  COLOR_CYAN);
+                init_pair(pairGreenBlack,  COLOR_GREEN,  COLOR_BLACK);
+                init_pair(pairWhiteCyan,   COLOR_WHITE,  COLOR_CYAN);
+                init_pair(pairWhiteRed,    COLOR_WHITE,  COLOR_RED);
+                init_pair(pairBlackYellow, COLOR_BLACK,  COLOR_YELLOW);
+        }
+
+        curs_set(0);
+
+        return true;
+} // end initialize
+
+//--------------------------------------------------------------------
+// Visible difference between insert and overstrike mode
+
+void showCursor(bool over=false)
+{
+        over ? curs_set(2) : curs_set(1);
+
+#if SET_CURSOR_COLOR
+        over ? printf("\e]12;%s\a", colorDelete) : printf("\e]12;%s\a", colorInsert);
+
+        fflush(stdout);
+#endif
+}
+
+void hideCursor()
+{
+        curs_set(0);
+}
+
+//--------------------------------------------------------------------
+// Shutdown ncurses
+
+void shutdown()
+{
+        delwin(winInput);
+        delwin(winHelp);
+
+        showCursor();
+
+        endwin();
+}
+
+//--------------------------------------------------------------------
+// Error exit ncurses
+
+void exitMsg(int status, const char* message)
+{
+        shutdown();
+
+        errx(status, message);
+}
+
+//--------------------------------------------------------------------
+// Reset variables for ascii mode
+
+void setViewMode()
+{
+        lineWidth = modeAscii ? lineWidthAsc : lineWidthAsc / 4;
+
+        bufSize = numLines * lineWidth;
+
+        searchIndent = lineWidth * 3;
+
+        steps[cmmMoveByte] = 1;
+        steps[cmmMoveLine] = lineWidth;
+        steps[cmmMovePage] = bufSize - lineWidth;
+        steps[cmmMoveAll]  = 0;
+}
+
+//--------------------------------------------------------------------
+// Set variables for dynamic width  ##:y
+
+void calcScreenLayout()
+{
+        if (COLS < minScreenWidth) {
+                string err("The screen must be at least " + to_string(minScreenWidth) + " characters wide.");
+
+                exitMsg(31, err.c_str());
+        }
+
+        if (LINES < minScreenHeight) {
+                string err("The screen must be at least " + to_string(minScreenHeight) + " lines high.");
+
+                exitMsg(32, err.c_str());
+        }
+
+        short tera = sizeTera ? 3 : 0;  // use large addresses only if needed
+
+        leftMar = 11 + tera;
+
+        if (COLS >= 140 + tera) {
+                lineWidth   = 32;
+                screenWidth = 140 + tera;
+                leftMar2    = 108 + tera;
+        }
+        else if (COLS >= 108 + tera) {
+                lineWidth   = 24;
+                screenWidth = 108 + tera;
+                leftMar2    = 84  + tera;
+        }
+        else {
+                lineWidth   = 16;
+                screenWidth = 76 + tera;
+                leftMar2    = 60 + tera;
+        }
+
+        lineWidthAsc = lineWidth * 4;
+
+        inWidth = (sizeTera ? 15 : 11) + 1;  // sign
+
+        linesTotal = LINES;
+
+        numLines = linesTotal / (singleFile ? 1 : 2) - 1;
+
+        setViewMode();
+} // end calcScreenLayout
+
+//--------------------------------------------------------------------
+// Convert a character to uppercase
+
+int upCase(int c)
+{
+        return (c >= 'a' && c <= 'z') ? c & ~0x20 : c;
+}
+
+//--------------------------------------------------------------------
+// Convert buffer to lowercase
+
+void lowCase(Byte* buf, Size len)
+{
+        for (Size i=0; i < len; ++i) {
+                if (buf[i] <= 'Z' && buf[i] >= 'A') {
+                        buf[i] |= 0x20;
+                }
+        }
+}
+
+//--------------------------------------------------------------------
+// Convert hex string to bytes
+
+int packHex(char* buf)
+{
+        Byte *pb = (Byte*) buf,
+             *po = pb;
+
+        for (Byte b; (b = *pb); ++pb) {
+                if (b == ' ') {
+                        continue;
+                }
+                else {
+                        b = (b - (*pb++ > 64 ? 55 : 48)) << 4;
+
+                        b |= *pb - (*pb > 0x40 ? 0x37 : 0x30);
+
+                        *po++ = b;
+                }
+        }
+
+        return po - (Byte*) buf;
+}
+
+//--------------------------------------------------------------------
+// My pretty printer
+
+char *pretty(char *buffer, FPos *size, int sign)
+{
+        char aBuf[64],
+             *pa = aBuf,
+             *pb = buffer;
+
+        sprintf(aBuf, (sign ? "%+ld" : "%ld"), *size);
+
+        int len = strlen(aBuf);
+
+        while (len) {
+                *pb++ = *pa++;
+
+                if (sign) {
+                        --sign;
+                        --len;
+                }
+                else {
+                        if (--len && ! (len % 3)) {
+                                if (thouSep) {
+                                        *pb++ = thouSep;
+                                }
+                        }
+                }
+        }
+        *pb = 0;
+
+        return buffer;
+} // end pretty
+
+//--------------------------------------------------------------------
+// Help window
+
+void displayHelp()
+{
+        touchwin(winHelp);
+        wrefresh(winHelp);
+        wgetch(winHelp);
+}
+
+//--------------------------------------------------------------------
+// Position the input window
+
+void positionInWin(Command cmd, short width, const char *title, short height=3)
+{
+        if (wresize(winInput, height, width) != OK) {
+                exitMsg(41, "Failed to resize window.");
+        }
+
+        wbkgd(winInput, attribStyle[cInputWin]);
+        werase(winInput);
+
+        mvwin(winInput,
+                ((! singleFile && (cmd & cmgGotoBottom))
+                      ? ((cmd & cmgGotoTop)
+                              ? numLines                  // Moving both
+                              : numLines + numLines / 2)  // Moving bottom
+                      : (numLines - 1 ) / 2),             // Moving top
+                 (screenWidth - width) / 2);
+
+        box(winInput, 0, 0);
+
+        mvwaddstr(winInput, 0, (width - strlen(title)) / 2, title);
 }
 
 //====================================================================
-// Class ConWindow   ##:win
+// Class ConWindow  ##:win
 
 class ConWindow
 {
- protected:
-  WINDOW        *winW;
+    protected:
+        WINDOW         *winW;
 
- public:
-                ConWindow()                             {}
-               ~ConWindow()                             { closeW(); }
+    public:
+        ConWindow()                                             {}
+       ~ConWindow()                                             { delwin(winW); winW = NULL; }
 
-  static bool   startup();
-  static void   shutdownW();
+        void            initW(short x, short y, short width, short height, Style style);
+        void            updateW()                               { touchwin(winW); wrefresh(winW); }
+        int             readKeyW()                              { return wgetch(winW); }
 
-  void          initW(short x, short y, short width, short height, Style style);
-  void          updateW()                               { touchwin(winW); wrefresh(winW); }
-  int           readKeyW()                              { return wgetch(winW); }
-  void          closeW()                                { if (winW) { delwin(winW); winW = NULL; } }
+        void            put(short x, short y, const char* s)    { mvwaddstr(winW, y, x, s); }
+        void            setAttribs(Style color)                 { wattrset(winW, attribStyle[color]); }
+        void            putAttribs(short x, short y, Style color, short count);
 
-  void          put(short x, short y, const char* s)    { mvwaddstr(winW, y, x, s); }
-  void          setAttribs(Style color)                 { wattrset(winW, attribStyle[color]); }
-  void          putAttribs(short x, short y, Style color, short count);
+        void            setCursor(short x, short y)             { wmove(winW, y, x); }
 
-  void          setCursor(short x, short y)             { wmove(winW, y, x); }
-  static void   showCursor(bool insert=true);
-  static void   hideCursor()                            { curs_set(0); }
 }; // end ConWindow
 
-//--------------------------------------------------------------------
-// Start up the window system
-
-bool ConWindow::startup()
-{
-  if (!initscr()) return false;  // initialize the curses library
-  set_escdelay(10);              // for static linking
-  atexit(ConWindow::shutdownW);  // just in case
-
-  keypad(stdscr, true);         // enable keyboard mapping
-  nonl();           // tell curses not to do NL->CR/NL on output
-  cbreak();         // take input chars one at a time, no wait for \n
-  noecho();         // do not echo input
-
-  if (has_colors()) {
-    start_color();
-
-    init_pair(pairWhiteBlue,   COLOR_WHITE,  COLOR_BLUE);
-    init_pair(pairWhiteBlack,  COLOR_WHITE,  COLOR_BLACK);
-    init_pair(pairRedWhite,    COLOR_RED,    COLOR_WHITE);
-    init_pair(pairYellowBlue,  COLOR_YELLOW, COLOR_BLUE);
-    init_pair(pairGreenBlue,   COLOR_GREEN,  COLOR_BLUE);
-    init_pair(pairBlackCyan,   COLOR_BLACK,  COLOR_CYAN);
-    init_pair(pairGreenBlack,  COLOR_GREEN,  COLOR_BLACK);
-    init_pair(pairWhiteCyan,   COLOR_WHITE,  COLOR_CYAN);
-    init_pair(pairWhiteRed,    COLOR_WHITE,  COLOR_RED);
-    init_pair(pairBlackYellow, COLOR_BLACK,  COLOR_YELLOW);
-  } // end if terminal has color
-
-  hideCursor();
-  return true;
-} // end ConWindow::startup
-
-//--------------------------------------------------------------------
-// Shut down the window system
-
-void ConWindow::shutdownW()
-{
-  if (!isendwin()) {
-    showCursor();
-    endwin();
-  }
-}
+//====================================================================
+// Class ConWindow member functions
 
 //--------------------------------------------------------------------
 // Initialize the window
 
 void ConWindow::initW(short x, short y, short width, short height, Style attrib)
 {
-  if ((winW = newwin(height, width, y, x)) == 0)
-    exitMsg(91, "Internal error: Failed to create window");
+        if (! (winW = newwin(height, width, y, x))) {
+                exitMsg(21, "Failed to create main window.");
+        }
 
-  wbkgd(winW, attribStyle[attrib]);
+        wbkgd(winW, attribStyle[attrib]);
 
-  keypad(winW, TRUE);
+        keypad(winW, TRUE);
 }
 
 //--------------------------------------------------------------------
@@ -424,91 +718,79 @@ void ConWindow::initW(short x, short y, short width, short height, Style attrib)
 
 void ConWindow::putAttribs(short x, short y, Style color, short count)
 {
-  mvwchgat(winW, y, x, count, attribStyle[color], colorStyle[color], NULL);
-}
-
-//--------------------------------------------------------------------
-// Visible difference between insert and overstrike mode
-
-void ConWindow::showCursor(bool insert)
-{
-        insert ? curs_set(1) : curs_set(2);
-
-#if SET_CURSOR_COLOR
-        insert ? printf("\e]12;%s\a", colorInsert) : printf("\e]12;%s\a", colorDelete);
-
-        fflush(stdout);
-#endif
+        mvwchgat(winW, y, x, count, attribStyle[color], colorStyle[color], NULL);
 }
 
 //====================================================================
-// Class FileDisplay
+// Class FileDisplay  ##:file
 
- class Difference;
+class Difference;
 
-class FileDisplay  // ##:file
+class FileDisplay
 {
-  friend class Difference;
+    friend class Difference;
 
-  ConWindow             cwinF;
+        ConWindow               cwinF;
 
-  const Difference     *diffsF;
+        const Difference       *diffsF;
 
-  char                  fileName[maxPath];
-  File                  fd;
-  bool                  editable;  // file r/w
-  bool                  writable;  // filehandle r/w
+        char                   *fileName;
+        File                    fd;
+        bool                    editable;
 
-  Byte                 *dataF;
-  int                   bufContents;
-  FPos                  offset;
-  FPos                  prevOffset;
-  FPos                  diffOffset;
-  FPos                  lastOffset;
+        Byte                   *dataF;
+        int                     dataSize;
+        FPos                    offset;
+        FPos                    prevOffset;
+        FPos                    diffOffset;
+        FPos                    lastOffset;
 
-  FPos                 *addr;
-  int                   se4rch;
+        FPos                   *addr;
+        int                     se4rch;
 
- public:
-  FPos                  filesize;
-  FPos                  searchOff;
-  FPos                  scrollOff;
-  FPos                  repeatOff;
-  bool                  advance;
-  bool                  two;
+    public:
+        FPos                    searchOff;
+        FPos                    scrollOff;
+        FPos                    repeatOff;
+        Size                    filesize;
+        Size                    laptime;
+        bool                    two;
 
- public:
+    public:
                 FileDisplay()                           {}
                ~FileDisplay();
 
-  bool          setFile(const char* aFileName);
-  void          initF(int y, const Difference* aDiff);
-  void          resizeF();
-  void          updateF()                               { cwinF.updateW(); }
-  int           readKeyF()                              { return cwinF.readKeyW(); }
-  void          shutDownF()                             { cwinF.closeW(); }
+        bool    setFile(char* FileName);
+        void    initF(int y, const Difference* Diff);
+        void    resizeF();
+        void    updateF()                               { cwinF.updateW(); }
+        int     readKeyF()                              { return cwinF.readKeyW(); }
 
-  void          display();
-  void          busy(bool on=false, bool ic=false);
-  void          highEdit(short count);
+        void    display();
+        void    busy(bool on, bool ic);
+        void    highEdit(short count);
 
-  bool          edit(const FileDisplay* other);
-  void          setByte(short x, short y, Byte b);
+        void    edit(const FileDisplay* other);
+        void    editOut(short outOffset);
+        bool    WriteTail(FPos start);
+        bool    assure();
+        void    progress1();
+        void    progress(wchar_t* bar, int count, int delay, int stint);
+        Size    finish(int init);
 
-  void          setLast()                               { lastOffset = offset; }
-  void          getLast()                               { FPos tmp = offset; moveTo(lastOffset); lastOffset = tmp; }
-  void          skip(bool upwards=false);
-  void          sync(const FileDisplay* other);
+        void    setLast()                               { lastOffset = offset; }
+        void    getLast()                               { FPos tmp = offset; moveTo(lastOffset); lastOffset = tmp; }
+        void    skip(bool upwards);
+        void    sync(const FileDisplay* other);
 
-  void          move(FPos step)                         { moveTo(offset + step); }
-  void          moveTo(FPos newOffset);
-  void          moveToEnd();
-  void          moveTo(const Byte* searchFor, int searchLen);
-  void          moveToBack(const Byte* searchFor, int searchLen);
+        void    move(FPos step)                         { moveTo(offset + step); }
+        void    moveTo(FPos newOffset);
+        void    moveToEnd()                             { moveTo(filesize - steps[cmmMovePage]); }
+        void    moveForw(const Byte* searchFor, Size searchLen);
+        void    moveBack(const Byte* searchFor, Size searchLen);
 
-  void          seekNotChar(bool upwards=false);
-  void          smartScroll();
-
+        void    seekNotChar(bool upwards);
+        void    smartScroll();
 }; // end FileDisplay
 
 //====================================================================
@@ -516,132 +798,67 @@ class FileDisplay  // ##:file
 
 class Difference
 {
- friend void FileDisplay::display();
+    friend void FileDisplay::display();
 
- protected:
-  Byte*         dataD;
-  FileDisplay*  file1D;
-  FileDisplay*  file2D;
+    protected:
+        Byte           *dataD;
+        FileDisplay    *file1D;
+        FileDisplay    *file2D;
 
- public:
-  Difference(FileDisplay* aFile1, FileDisplay* aFile2): file1D(aFile1), file2D(aFile2) {}
- ~Difference() { delete [] dataD; }
-  void resizeD();
-  int  compute(Command cmd);
-  void speedup(int way);
+    public:
+                Difference(FileDisplay* File1, FileDisplay* File2):
+                                        file1D(File1), file2D(File2)  {}
+               ~Difference()                                            { delete [] dataD; }
+        void    resizeD();
+        int     compute(Command cmd);
+        void    speedup(int way);
 }; // end Difference
 
 //====================================================================
-// Class InputManager
-
-class InputManager
-{
- private:
-  char*        buf;             // The editing buffer
-  const char*  restrictChar;    // If non-NULL, only allow these chars
-  StrDeq&      history;         // The history vector to use
-  size_t       historyPos;      // The current offset into history[]
-  String       cur;             // The current input line
-  int          maxLen;          // The size of buf (not including NUL)
-  int          len;             // The current length of the string
-  int          i;               // The current cursor position
-  bool         upcase;          // Force all characters to uppercase?
-  bool         splitHex;        // Entering space-separated hex bytes?
-  bool         insert;          // False for overstrike mode
-
- private:
-  bool normalize(int pos);
-  void useHistory(int delta);
-
- public:
-  InputManager(char* aBuf, int aMaxLen, StrDeq& aHistory);
-  bool run();
-
-  void setCharacters(const char* aRestriction)  { restrictChar = aRestriction; }
-  void setSplitHex(bool val)                    { splitHex = val; }
-  void setUpcase(bool val)                      { upcase = val; }
-}; // end InputManager
-
-//====================================================================
-// Global Variables   ##:vars
+// Object instantiation
 
 FileDisplay     file1, file2;
 
 Difference      diffs(&file1, &file2);
-
-WINDOW         *winInput,
-               *winHelp;
-
-const char      *program_name;  // Name under which this program was invoked
-
-bool            singleFile;
-bool            showRaster;
-bool            sizeTera;
-bool            modeAscii;
-bool            ignoreCase;
-int             haveDiff;
-LockState       lockState;
-
-String          lastSearch, lastSearchIgnCase;
-StrDeq          hexSearchHistory, textSearchHistory, positionHistory;
-
-// set dynamically for 16/24/32 byte width
-int screenWidth;   // Number of columns in curses
-int linesTotal;    // Number of lines in curses
-int numLines;      // Number of lines of each file to display
-int bufSize;       // Number of bytes of each file to display
-int lineWidth;     // Number of bytes displayed per line
-int lineWidthAsc;  // Number of bytes displayed per line ascii
-int inWidth;       // Number of digits in input window
-int leftMar;       // Starting column of hex display
-int leftMar2;      // Starting column of ASCII display
-int searchIndent;  // Lines of search result indentation
-int steps[4];      // Number of bytes to move for each step
-
-Byte bufFile1[sizeReadBuf];
-Byte bufFile2[sizeReadBuf];
 
 //====================================================================
 // Class Difference member functions
 
 void Difference::resizeD()
 {
-  if (dataD)
-    delete [] dataD;
-
-  dataD = new Byte[bufSize];
+        dataD = new Byte[bufSize];
 }
 
 //--------------------------------------------------------------------
-// Compute differences   ##:u
+// Compute differences  ##:u
 
 int Difference::compute(Command cmd)
 {
         haveDiff = 0;
         memset(dataD, 0, bufSize);
 
-        if (! file1D->bufContents) {
+        if (! file1D->dataSize) {
                 file1.moveToEnd();
         }
 
-        if (! file2D->bufContents) {
+        if (! file2D->dataSize) {
                 file2.moveToEnd();
         }
 
-        const Byte *buf1 = file1D->dataF;
-        const Byte *buf2 = file2D->dataF;
+        const Byte *buf1 = file1D->dataF,
+                   *buf2 = file2D->dataF;
 
-        int size = min(file1D->bufContents, file2D->bufContents);
+        int size = min(file1D->dataSize, file2D->dataSize);
 
         int diff = 0;
         for (; diff < size; ++diff) {
-                if (*(buf1++) != *(buf2++)) {
+                if (*buf1++ != *buf2++) {
                         dataD[diff] = true;
                         haveDiff++;
                 }
         }
 
-        size = max(file1D->bufContents, file2D->bufContents);
+        size = max(file1D->dataSize, file2D->dataSize);
 
         for (; diff < size; ++diff) {
                 dataD[diff] = true;
@@ -652,49 +869,50 @@ int Difference::compute(Command cmd)
                 return 1;
         }
 
-        if (cmd == cmNextDiff && (file1D->bufContents < bufSize || file2D->bufContents < bufSize)) {
-                haveDiff = -1;
+        if (cmd == cmNextDiff && (file1D->dataSize < bufSize || file2D->dataSize < bufSize)) {
+                haveDiff = -1;  // move anyway
         }
 
         return haveDiff;
 } // end Difference::compute
 
 //--------------------------------------------------------------------
-// Speedup differ - diff in next/prev sizeReadBuf bytes
+// Speedup differ - diff in next/prev staticSize bytes
 
-void Difference::speedup(int way) {
+void Difference::speedup(int way)
+{
         if (way > 0) {
                 SeekFile(file1D->fd, file1D->offset);
                 SeekFile(file2D->fd, file2D->offset);
 
-                while (file1D->offset + sizeReadBuf < file1.filesize &&
-                                file2D->offset + sizeReadBuf < file2.filesize && ! stopRead) {
-                        ReadFile(file1D->fd, bufFile1, sizeReadBuf);
-                        ReadFile(file2D->fd, bufFile2, sizeReadBuf);
+                while (file1D->offset + staticSize < file1.filesize &&
+                                file2D->offset + staticSize < file2.filesize && ! stopRead) {
+                        ReadFile(file1D->fd, bufFile1, staticSize);
+                        ReadFile(file2D->fd, bufFile2, staticSize);
 
-                        if (memcmp(bufFile1, bufFile2, sizeReadBuf)) {
+                        if (memcmp(bufFile1, bufFile2, staticSize)) {
                                 break;
                         }
 
-                        file1D->offset += sizeReadBuf;
-                        file2D->offset += sizeReadBuf;
+                        file1D->offset += staticSize;
+                        file2D->offset += staticSize;
                 }
         }
         else {  // downwards
-                while (file1D->offset - sizeReadBuf > 0 &&
-                                file2D->offset - sizeReadBuf > 0 && ! stopRead) {
-                        SeekFile(file1D->fd, file1D->offset - sizeReadBuf);
-                        SeekFile(file2D->fd, file2D->offset - sizeReadBuf);
+                while (file1D->offset - staticSize > 0 &&
+                                file2D->offset - staticSize > 0 && ! stopRead) {
+                        SeekFile(file1D->fd, file1D->offset - staticSize);
+                        SeekFile(file2D->fd, file2D->offset - staticSize);
 
-                        ReadFile(file1D->fd, bufFile1, sizeReadBuf);
-                        ReadFile(file2D->fd, bufFile2, sizeReadBuf);
+                        ReadFile(file1D->fd, bufFile1, staticSize);
+                        ReadFile(file2D->fd, bufFile2, staticSize);
 
-                        if (memcmp(bufFile1, bufFile2, sizeReadBuf)) {
+                        if (memcmp(bufFile1, bufFile2, staticSize)) {
                                 break;
                         }
 
-                        file1D->offset -= sizeReadBuf;
-                        file2D->offset -= sizeReadBuf;
+                        file1D->offset -= staticSize;
+                        file2D->offset -= staticSize;
                 }
         }
 } // end Difference::speedup
@@ -704,72 +922,86 @@ void Difference::speedup(int way) {
 
 FileDisplay::~FileDisplay()
 {
-  shutDownF();
-  CloseFile(fd);
-  delete [] dataF;
-  free(addr);
+        if (fd) {
+                close(fd);
+        }
+
+        delete [] dataF;
+
+        free(addr);
 }
 
 //--------------------------------------------------------------------
 // Open a file for display
 
-bool FileDisplay::setFile(const char* aFileName)
+bool FileDisplay::setFile(char* FileName)
 {
-        strncpy(fileName, aFileName, maxPath - 1);
-        fileName[maxPath - 1] = '\0';
+        fileName = FileName;
 
-        File e = OpenFile(fileName, true);
-        if (e > InvalidFile) {
+        File probe = OpenFile(fileName, true);
+
+        if (probe > 0) {
                 editable = true;
-                CloseFile(e);
+                close(probe);
         }
 
-        fd = OpenFile(fileName);
-
-        if (fd == InvalidFile)
+        if ((fd = OpenFile(fileName)) < 0) {
                 return false;
+        }
 
-        filesize = SeekFile(fd, 0, SEEK_END);
-
-        if (filesize > 1000000000000000000)
+        if ((filesize = SeekFile(fd, 0, SEEK_END)) < 0) {
                 return false;
+        }
 
-        if (filesize > 68719476736)
-                sizeTera = true;  // 2**30*64 == 0x10**9 == 64GB
+        if (filesize > 68719476736) {  // 2**30*64 == 0x10**9 == 64GB
+                sizeTera = true;
+        }
 
         SeekFile(fd, 0);
 
         return true;
 } // end FileDisplay::setFile
 
-void FileDisplay::initF(int y, const Difference* aDiff)
-{
-  diffsF = aDiff;
-  two = y ? true : false;
-
-  cwinF.initW(0, y, screenWidth, numLines + 1, cFileWin);
-
-  resizeF();
-
-  addr = (FPos*) calloc(numLines, sizeof(FPos));
-}
-
 void FileDisplay::resizeF()
 {
-        if (dataF) delete [] dataF;
+        delete [] dataF;
+
         dataF = new Byte[bufSize];
 
         moveTo(offset);
 }
 
 //--------------------------------------------------------------------
-// Display the file contents   ##:disp
+// Set member variables
+
+void FileDisplay::initF(int y, const Difference* Diff)
+{
+        diffsF = Diff;
+        two = y ? true : false;
+
+        cwinF.initW(0, y, screenWidth, numLines + 1, cMainWin);
+
+        resizeF();
+
+        addr = (FPos*) calloc(numLines, sizeof(FPos));
+}
+
+//--------------------------------------------------------------------
+// Display the file contents  ##:disp
 
 void FileDisplay::display()
 {
-        if (! fd) return;
+        if (! fd) {
+                return;
+        }
 
-        short first, last, row, col, idx, lineLength;
+        short first,
+              last,
+              row,
+              col,
+              idx,
+              lineLength;
+
         FPos lineOffset = offset;
 
         if (scrollOff) {
@@ -777,37 +1009,48 @@ void FileDisplay::display()
         }
         else if (offset != prevOffset) {
                 diffOffset = offset - prevOffset;
+
                 prevOffset = offset;
         }
 
-        Byte pos = (scrollOff ? scrollOff + lineWidth : offset + bufSize) * 100 / filesize;
+        Byte pos = (scrollOff ? scrollOff + lineWidth : offset + bufSize)
+                        * 100
+                        / (filesize > bufSize ? filesize : bufSize);
 
         char bufStat[screenWidth + 1] = { 0 };
         memset(bufStat, ' ', screenWidth);
 
-        char buf[90], buf2[2][40];
-        sprintf(buf, " %s %s %d%% %s %s", pretty(buf2[0], &offset, 0), pretty(buf2[1], &diffOffset, 1),
-                pos > 100 ? 100 : pos, ignoreCase ? "I" : "i", editable ? "RW" : "RO");
+        char buf[96],
+             buf2[2][48];
 
-        short size_name = screenWidth - strlen(buf);
-        short size_fname = strlen(fileName);
+        sprintf(buf, " %s %s %d%% %s %s",
+                pretty(buf2[0], &offset, 0),
+                pretty(buf2[1], &diffOffset, 1),
+                pos > 100 ? 100 : pos,
+                ignoreCase ? "I" : "i",
+                editable ? "RW" : "RO");
+
+        short size_name = screenWidth - strlen(buf),
+              size_fname = strlen(fileName);
 
         if (size_fname <= size_name) {
                 memcpy(bufStat, fileName, size_fname);
         }
         else {
                 first = size_name / 4;
+
                 memcpy(bufStat, fileName, first);
                 memcpy(bufStat + first, " ... ", 5);
 
                 last = size_name - first - 5;
+
                 memcpy(bufStat + first + 5, fileName + size_fname - last, last);
         }
 
         memcpy(bufStat + size_name, buf, strlen(buf));
 
         cwinF.put(0, 0, bufStat);
-        cwinF.putAttribs(0, 0, cFileName, strlen(bufStat));
+        cwinF.putAttribs(0, 0, cName, strlen(bufStat));
 
         if (lockState == lockBottom && ! two) {
                 cwinF.putAttribs(0, 0, cHighFile, size_name);
@@ -818,11 +1061,12 @@ void FileDisplay::display()
 
         if (diffOffset < 0) {
                 char *pc = (char*) memchr(buf, '-', strlen(buf));
-                cwinF.putAttribs(size_name + (pc - buf), 0, cFileSearch, 1);
+
+                cwinF.putAttribs(size_name + (pc - buf), 0, cSearch, 1);
         }
 
-        char bufHex[screenWidth + 1] = { 0 };
-        char bufAsc[  lineWidth + 1] = { 0 };
+        char bufHex[screenWidth + 1] = { 0 },
+             bufAsc[  lineWidth + 1] = { 0 };
 
         for (row=0; row < numLines; ++row) {
                 memset(bufHex, ' ', screenWidth);
@@ -833,15 +1077,12 @@ void FileDisplay::display()
                 }
 
                 char *pbufHex = bufHex;
-                pbufHex += sprintf(pbufHex, "%0*lX ", sizeTera ? 12 : 9, lineOffset);
 
-                lineLength = min(lineWidth, bufContents - row * lineWidth);
+                pbufHex += sprintf(pbufHex, "%0*lX  ", sizeTera ? 12 : 9, lineOffset);
+
+                lineLength = min(lineWidth, dataSize - row * lineWidth);
 
                 for (col = idx = 0; col < lineLength; ++col, ++idx) {
-                        if (! col) {
-                                *pbufHex++ = ' ';
-                        }
-
                         Byte b = dataF[row * lineWidth + col];
 
                         if (! modeAscii) {
@@ -868,55 +1109,62 @@ void FileDisplay::display()
                                 break;
                         }
                 }
-                cwinF.putAttribs(col, row + 1, cFileAddr, (sizeTera ? 12 : 9) - col);
+                cwinF.putAttribs(col, row + 1, cAddress, (sizeTera ? 12 : 9) - col);
 
                 if (showRaster) {
                         if (sizeTera) {
-                                cwinF.putAttribs(0, row + 1, cFileMark, 1);
+                                cwinF.putAttribs(0, row + 1, cRaster, 1);
                         }
-                        cwinF.putAttribs(sizeTera ? 4 : 1, row + 1, cFileMark, 1);
-                        cwinF.putAttribs(sizeTera ? 8 : 5, row + 1, cFileMark, 1);
+                        cwinF.putAttribs(sizeTera ? 4 : 1, row + 1, cRaster, 1);
+                        cwinF.putAttribs(sizeTera ? 8 : 5, row + 1, cRaster, 1);
                 }
 
-                if (! modeAscii && showRaster && bufHex[leftMar] != ' ')
+                if (! modeAscii && showRaster && bufHex[leftMar] != ' ') {
                         for (col=0; col <= lineWidth - 8; col += 8) {
-                                cwinF.putAttribs(leftMar  + col * 3 - 1, row + 1, cFileMark, 1);
-                                cwinF.putAttribs(leftMar2 + col        , row + 1, cFileMark, 1);
+                                cwinF.putAttribs(leftMar  + col * 3 - 1, row + 1, cRaster, 1);
+                                cwinF.putAttribs(leftMar2 + col        , row + 1, cRaster, 1);
                         }
+                }
 
-                if (haveDiff)
-                        for (col=0; col < lineWidth; ++col)
+                if (haveDiff) {
+                        for (col=0; col < lineWidth; ++col) {
                                 if (diffsF->dataD[row * lineWidth + col]) {
-                                        cwinF.putAttribs(leftMar  + col * 3, row + 1, cFileDiff, 2);
-                                        cwinF.putAttribs(leftMar2 + col    , row + 1, cFileDiff, 1);
+                                        cwinF.putAttribs(leftMar  + col * 3, row + 1, cDiff, 2);
+                                        cwinF.putAttribs(leftMar2 + col    , row + 1, cDiff, 1);
                                 }
+                        }
+                }
 
-                if (se4rch && row >= (searchOff ? searchIndent / lineWidth : 0))
-                        for (col=0; col < lineWidth && se4rch; ++col, --se4rch) {
+                if (se4rch && row >= (searchOff >= searchIndent ? searchIndent / lineWidth : 0)) {
+                        for (col=0; se4rch && col < lineWidth; --se4rch, ++col) {
                                 if (modeAscii) {
-                                        cwinF.putAttribs(leftMar  + col    , row + 1, cFileSearch, 1);
+                                        cwinF.putAttribs(leftMar  + col    , row + 1, cSearch, 1);
                                 }
                                 else {
-                                        cwinF.putAttribs(leftMar  + col * 3, row + 1, cFileSearch, 2);
-                                        cwinF.putAttribs(leftMar2 + col    , row + 1, cFileSearch, 1);
+                                        cwinF.putAttribs(leftMar  + col * 3, row + 1, cSearch, 2);
+                                        cwinF.putAttribs(leftMar2 + col    , row + 1, cSearch, 1);
                                 }
                         }
+                }
 
-                if (*(addr + row))
+                if (*(addr + row)) {
                         for (col=0; col < lineWidth; ++col) {
                                 if (modeAscii) {
-                                        cwinF.putAttribs(leftMar  + col    , row + 1, cFileDiff, 1);
+                                        cwinF.putAttribs(leftMar  + col    , row + 1, cDiff, 1);
                                 }
                                 else {
-                                        cwinF.putAttribs(leftMar  + col * 3, row + 1, cFileDiff, 2);
-                                        cwinF.putAttribs(leftMar2 + col    , row + 1, cFileDiff, 1);
+                                        cwinF.putAttribs(leftMar  + col * 3, row + 1, cDiff, 2);
+                                        cwinF.putAttribs(leftMar2 + col    , row + 1, cDiff, 1);
                                 }
                         }
+                }
+
                 lineOffset += lineWidth;
-        } // end for row up to numLines
+        }
 
         if (scrollOff) {
                 moveTo(offset);  // reload buffer
+
                 memset(addr, 0, numLines * sizeof(FPos));
         }
 
@@ -926,7 +1174,7 @@ void FileDisplay::display()
 //--------------------------------------------------------------------
 // Busy status
 
-void FileDisplay::busy(bool on, bool ic)
+void FileDisplay::busy(bool on=false, bool ic=false)
 {
         if (on) {
                 cwinF.putAttribs(screenWidth - (ic ? 4 : 2),  0, cHighBusy, ic ? 1 : 2);
@@ -934,7 +1182,11 @@ void FileDisplay::busy(bool on, bool ic)
         }
         else {
                 napms(150);
-                cwinF.putAttribs(screenWidth - (ic ? 4 : 2),  0, cFileName, ic ? 1 : 2);
+                cwinF.putAttribs(screenWidth - (ic ? 4 : 2),  0, cName, ic ? 1 : 2);
+
+                if (! singleFile && ! two) {
+                        updateF();
+                }
         }
 }
 
@@ -947,176 +1199,663 @@ void FileDisplay::highEdit(short count)
 }
 
 //--------------------------------------------------------------------
-// Edit the file   ##:edit
+// Display the edit buffer  ##:out
 
-bool FileDisplay::edit(const FileDisplay* other)
+void FileDisplay::editOut(short outOffset)
 {
-  if (!bufContents && offset)
-    return false;               // You must not be completely past EOF
+        FPos lineOffset = offset + outOffset;
 
-  if (!writable) {
-    File w = OpenFile(fileName, true);
-    if (w == InvalidFile) return false;
-    CloseFile(fd);
-    fd = w;
-    writable = true;
-  }
+        char bufHex[screenWidth + 1] = { 0 },
+             bufAsc[  lineWidth + 1] = { 0 };
 
-  if (bufContents < bufSize)
-    memset(dataF + bufContents, 0, bufSize - bufContents);
+        for (int row=0; row < numLines; ++row) {
+                memset(bufHex, ' ', screenWidth);
+                memset(bufAsc, ' ',   lineWidth);
 
-  short x = 0;
-  short y = 0;
-  bool  hiNib = true;
-  bool  ascii = false;
-  bool  changed = false;
-  int   key;
+                char *pbufHex = bufHex;
 
-  cwinF.setCursor(leftMar,1);
-  ConWindow::showCursor();
+                pbufHex += sprintf(pbufHex, "%0*lX  ", sizeTera ? 12 : 9, lineOffset);
 
-  for (;;) {
-    cwinF.setCursor((ascii ? leftMar2 + x : leftMar + 3*x + !hiNib), y+1);
-    key = readKeyF();
+                int lineLength = min(lineWidth, (int) editBytes.size() - outOffset - row * lineWidth);
 
-    switch (key) {
-     case KEY_ESCAPE: goto done;
-     case KEY_TAB:
-      hiNib = true;
-      ascii = !ascii;
-      break;
+                for (int col=0; col < lineLength; ++col) {
+                        Byte b = editBytes[outOffset + row * lineWidth + col];
 
-     case KEY_DELETE:
-     case KEY_BACKSPACE:
-     case KEY_LEFT:
-      if (!hiNib)
-        hiNib = true;
-      else {
-        if (!ascii) hiNib = false;
-        if (--x < 0) x = lineWidth-1;
-      }
-      if (hiNib || (x < lineWidth-1))
-        break;
-      // else fall thru
-     case KEY_UP:   if (--y < 0) y = numLines-1; break;
+                        pbufHex += sprintf(pbufHex, "%02X ", b);
 
-     default: {
-       short newByte = -1;
-       if ((key == KEY_RETURN) && other &&
-           (other->bufContents > x + y*lineWidth)) {
-         newByte = other->dataF[y * lineWidth + x]; // Copy from other file
-         hiNib = ascii; // Always advance cursor to next byte
-       } else if (ascii) {
-         if (isprint(key)) newByte = key;
-       } else { // hex
-         if (isdigit(key))
-           newByte = key - '0';
-         else if (isxdigit(key))
-           newByte = safeUC(key) - 'A' + 10;
-         if (newByte >= 0) {
-           if (hiNib)
-             newByte = (newByte * 0x10) | (0x0F & dataF[y * lineWidth + x]);
-           else
-             newByte |= 0xF0 & dataF[y * lineWidth + x];
-         } // end if valid digit entered
-       } // end else hex
-       if (newByte >= 0) {
-         changed = true;
-         setByte(x,y,newByte);
-       } else
-         break;
-     } // end default and fall thru
-     case KEY_RIGHT:
-      if (hiNib && !ascii)
-        hiNib = false;
-      else {
-        hiNib = true;
-        if (++x >= lineWidth) x = 0;
-      }
-      if (x || !hiNib)
-        break;
-      // else fall thru
-     case KEY_DOWN: if (++y >= numLines) y = 0;  break;
+                        bufAsc[col] = isprint(b) ? b : '.';
+                }
+                *pbufHex = ' ';
 
-    } // end switch
+                cwinF.put(0,        row + 1, bufHex);
+                cwinF.put(leftMar2, row + 1, bufAsc);
 
-  } // end forever
+                if (showRaster) {
+                        int col[] = { 0, 1, 4, 5, 8 };
 
- done:
-  if (changed) {
-    positionInWin(two ? cmgGotoBottom : cmgGotoTop, 25, "");
-    mvwaddstr(winInput, 1, 1, " Save changes (Y/N): ");
-    key = wgetch(winInput);
-    ConWindow::hideCursor();
+                        for (int i = sizeTera ? 0 : 1; i < 5; i += 2) {
+                                cwinF.putAttribs(col[i], row + 1, cRaster, 1);
+                        }
+                }
 
-    if (safeUC(key) != 'Y') {
-      changed = false;
-      moveTo(offset);           // Re-read buffer contents
-    } else {
-      SeekFile(fd, offset);
-      if (WriteFile(fd, dataF, bufContents)) {
-        mvwaddstr(winInput, 1, 1, "        Success.     ");
-        wrefresh(winInput);
-        napms(1500);
-      } else {
-        mvwaddstr(winInput, 1, 1, "        Failed!      ");
-        wgetch(winInput);
-      }
-    }
-  } else {
-    ConWindow::hideCursor();
-  }
-  return changed;
-} // end FileDisplay::edit
+                if (showRaster && bufHex[leftMar] != ' ') {
+                        for (int col=0; col <= lineWidth - 8; col += 8) {
+                                cwinF.putAttribs(leftMar  + col * 3 - 1, row + 1, cRaster, 1);
+                                cwinF.putAttribs(leftMar2 + col        , row + 1, cRaster, 1);
+                        }
+                }
+
+                for (int c, col=0; col < lineLength; ++col) {
+                        if ((c = editColor[outOffset + row * lineWidth + col])) {
+                                cwinF.putAttribs(leftMar  + col * 3, row + 1, (Style) c, 2);
+                                cwinF.putAttribs(leftMar2 + col    , row + 1, (Style) c, 1);
+                        }
+                }
+
+                lineOffset += lineWidth;
+        }
+} // end FileDisplay::editOut
 
 //--------------------------------------------------------------------
-// FileDisplay::setByte
+// Obtain confirmation for lengthy write
 
-void FileDisplay::setByte(short x, short y, Byte b)
+bool FileDisplay::assure()
 {
-  if (x + y*lineWidth >= bufContents) {
-    if (x + y*lineWidth > bufContents) {
-      short y1 = bufContents / lineWidth;
-      short x1 = bufContents % lineWidth;
-      while (y1 <= numLines) {
-        while (x1 < lineWidth) {
-          if ((x1 == x) && (y1 == y)) goto done;
-          setByte(x1,y1,0);
-          ++x1;
-        }
-        x1 = 0;
-        ++y1;
-      } // end while y1
-    } // end if more than 1 byte past the end
-   done:
-    ++bufContents;
-    dataF[y * lineWidth + x] = b ^ 1;         // Make sure it's different
-  } // end if past the end
+        bool ret = true;
+        Size diff = filesize - offset;
 
-  if (dataF[y * lineWidth + x] != b) {
-    dataF[y * lineWidth + x] = b;
-    char str[3];
-    sprintf(str, "%02X", b);
-    cwinF.setAttribs(cFileEdit);
-    cwinF.put(leftMar + 3*x, y+1, str);
-    str[0] = b >= 0x20 && b <= 0x7E ? b : '.';
-    str[1] = '\0';
-    cwinF.put(leftMar2 + x, y+1, str);
-    cwinF.setAttribs(cFileWin);
-  }
-} // end FileDisplay::setByte
+        if (diff > warnResize) {
+                char str[96],
+                     inp[4];
+
+                sprintf(str, " About to write *non-interruptable* %.1fGB!? {yes|no}: ", (double) diff / 1073741824);
+
+                echo();
+                for (;;) {
+                        positionInWin(two ? cmgGotoBottom : cmgGotoTop, 1+ strlen(str) +5+1, " Attention! ", 5);
+
+                        mvwaddstr(winInput, 2, 1, str);
+
+                        wgetnstr(winInput, inp, 3);
+
+                        if (! strcmp(inp, "yes")) {
+                                break;
+                        }
+
+                        else if (! strcmp(inp, "no")) {
+                                ret = false;
+                                break;
+                        }
+                }
+                noecho();
+        }
+        updateF();
+        hideCursor();
+
+        return ret;
+} // end FileDisplay::assure
+
+//--------------------------------------------------------------------
+// Progress bar single
+
+void FileDisplay::progress1()
+{
+        int blocks = 25,
+            delay  = 4;
+
+        hideCursor();
+        positionInWin(two ? cmgGotoBottom : cmgGotoTop, 2+ blocks +2, "");
+
+        wchar_t bar[blocks + 1];
+        memset(bar, 0, sizeof(bar));
+
+        for (int i=0; i < blocks; ++i) {
+                for (int j=0; j < 8; ++j) {
+                        bar[i] = barSyms[j];
+
+                        mvwaddwstr(winInput, 1, 2, bar);
+                        wrefresh(winInput);
+                        napms(delay);
+                }
+        }
+        napms(250);
+}
+
+//--------------------------------------------------------------------
+// Progress bar multiple
+
+void FileDisplay::progress(wchar_t* bar, int count, int delay, int stint=1)
+{
+        int pos = count * stint / 8,
+            sym = count * stint % 8;
+
+        for (int i=0; i < stint; ++i) {
+                bar[pos] = barSyms[sym % 8];
+
+                if (! (++sym % 8)) {
+                        ++pos;
+                }
+
+                mvwaddwstr(winInput, 1, 2, bar);
+                wrefresh(winInput);
+
+                if (delay) {
+                        napms(delay);
+                }
+        }
+}
+
+//--------------------------------------------------------------------
+// Progress bar end (or debug profiling)
+
+Size FileDisplay::finish(int init=0)
+{
+        timespec ts;
+
+        clock_gettime(CLOCK_TAI, &ts);
+
+        if (init) {
+                laptime = ts.tv_sec * 1000000000 + ts.tv_nsec;
+
+                return 0;
+        }
+
+        return (ts.tv_sec * 1000000000 + ts.tv_nsec - laptime);
+}
+
+//--------------------------------------------------------------------
+// Append the remainder
+
+bool FileDisplay::WriteTail(FPos start)
+{
+        bool insert = start > 0 ? true : false;
+
+        FPos srcOff = offset + dataSize,
+             dstOff = offset + start * (insert ? 1 : -1);
+        Size remain = filesize - srcOff;
+
+        int width = (screenWidth - 4) * 8,
+            level = (screenWidth / 3) * 8,
+            cargo = staticSize,
+            loops = remain / cargo,
+            scale = 0,
+            delay = 4,
+            count = 0,
+            stage = 0,
+            tally = 0,
+            final = 0;
+
+        Size round = 0,
+             chunk = 0;
+
+        if (! loops) {
+                progress1();
+        }
+
+        else if (loops > width) {
+                scale = loops / width + (loops % width ? 1 : 0);
+                width = loops / scale + (loops % scale ? 1 : 0);
+        }
+
+        else if (loops > level) {
+                width = loops;
+        }
+
+        else {
+                cargo = remain / level >> 12;
+                cargo *= 4096;  // page align
+
+                width = remain / cargo;
+        }
+
+        stage = width - 8;
+
+        width = width / 8 + (width % 8 ? 1 : 0);
+
+        wchar_t bar[width + 1];
+        memset(bar, 0, sizeof(bar));
+
+        if (loops) {
+                positionInWin(two ? cmgGotoBottom : cmgGotoTop, 2+ width +2, "");
+        }
+
+#if SHOW_WRITE_SUMMARY
+        int term = time(NULL);
+#endif
+        if (remain >= cargo) {
+                if (insert) {
+                        srcOff = filesize;  // downwards
+                        dstOff = filesize + start - dataSize;
+                }
+
+                while (remain >= cargo) {
+                        if (mScale > stage) {  // use only the last ones for timekeeping
+                                finish(1);
+                        }
+
+                        if (insert) {
+                                srcOff -= cargo;
+                        }
+                        SeekFile(fd, srcOff);
+                        ReadFile(fd, buffer, cargo);
+
+                        if (insert) {
+                                dstOff -= cargo;
+                        }
+                        else {
+                                srcOff += cargo;
+                        }
+
+                        SeekFile(fd, dstOff);
+                        if (! WriteFile(fd, buffer, cargo)) {
+                                return false;
+                        }
+                        if (! insert) {
+                                dstOff += cargo;
+                        }
+
+                        remain -= cargo;
+
+                        if (mScale > stage) {
+                                round += finish() + 1;  // assure non-zero
+                        }
+
+                        if (scale && count % scale) {
+                                count++;
+                                continue;
+                        }
+
+                        if (round) {
+                                if (! scale || tally++) {  // discard single round
+                                        chunk += round;
+                                        final++;
+                                }
+
+                                round = 0;
+                        }
+
+                        progress(bar, mScaleInc, delay);
+                }
+
+                if (insert) {
+                        srcOff -= remain;
+                        dstOff -= remain;
+                }
+        }
+
+        if (remain > 0) {
+                SeekFile(fd, srcOff);
+                ReadFile(fd, buffer, remain);
+
+                SeekFile(fd, dstOff);
+                if (! WriteFile(fd, buffer, remain)) {
+                        return false;
+                }
+        }
+
+        if (! insert && ftruncate(fd, dstOff + remain) == ERR) {
+                return false;
+        }
+
+#if SHOW_WRITE_SUMMARY
+        if (filesize - offset > warnResize) {
+                term = time(NULL) - term;
+
+                sprintf(bufTimer, "  %dsec (%.1fmin)  %ldMByte/s  ",
+                        term,
+                        (float) term / 60,
+                        (filesize - offset) / 1048576 / (term ? term : 1));
+        }
+#endif
+        if (loops) {
+                for (;;) {
+                        if (scale && count % scale) {
+                                ++count;
+                        }
+
+                        else if (mScale % 8) {  // neat finish
+                                progress(bar, mScaleInc, chunk / final / 1000000 + delay);
+                        }
+
+                        else {
+                                break;
+                        }
+                }
+                napms(600);
+        }
+
+        return true;
+} // end FileDisplay::WriteTail
+
+//--------------------------------------------------------------------
+// Edit the file  ##:edit
+
+void FileDisplay::edit(const FileDisplay* other)
+{
+        if (! editable) {
+                return;
+        }
+
+        bool hiNib   = true,
+             ascii   = false,
+             changed = false;
+
+        short x = 0,
+              y = 0,
+              outOffset;
+
+        int cur,
+            endY,
+            endX,
+            key;
+
+        editBytes.clear();
+        editColor.clear();
+
+        for (int i=0; i < dataSize; ++i) {
+                editBytes.push_back(dataF[i]);
+                editColor.push_back(0);
+        }
+
+        cwinF.setCursor(leftMar, 1);
+        showCursor();
+
+        for (;;) {
+                endY = editBytes.size() ? (editBytes.size() - 1) / lineWidth : 0;
+                endX = editBytes.size() ? (editBytes.size() - 1) % lineWidth : 0;
+
+                if (y > endY) {
+                        y = endY;
+                        x = endX;
+                }
+
+                if (y == endY && x > endX) {
+                        x = endX;
+                }
+
+                cur = y * lineWidth + x;
+
+                outOffset = cur >= bufSize ? (cur - bufSize) / lineWidth + 1 : 0;
+
+                editOut(outOffset * lineWidth);
+
+                cwinF.setCursor((ascii ? leftMar2 + x : leftMar + 3 * x + ! hiNib), y - outOffset + 1);
+
+                key = readKeyF();
+
+                switch (key) {
+                        case KEY_ESCAPE:
+                                goto done;
+
+                        case KEY_TAB:
+                                hiNib  = true;
+                                ascii ^= true;
+                                break;
+
+                        case KEY_IC:
+                                changed = true;
+
+                                editBytes.insert(editBytes.begin() + cur, ascii ? ' ' : '\0');
+                                editColor.insert(editColor.begin() + cur, cInsert);
+                                break;
+
+                        case KEY_DC:
+                                if (editBytes.size()) {
+                                        changed = true;
+
+                                        editBytes.erase(editBytes.begin() + cur);
+                                        editColor.erase(editColor.begin() + cur);
+                                }
+                                break;
+
+                        case KEY_HOME:
+                                y = x = 0;
+                                break;
+
+                        case KEY_END:
+                                y = endY;
+                                x = endX;
+                                break;
+
+                        case KEY_LEFT:
+                                if (! hiNib) {
+                                        hiNib = true;
+                                        break;
+                                }
+
+                                else {
+                                        if (! ascii) {
+                                                hiNib = false;
+                                        }
+
+                                        if (--x < 0) {
+                                                x = y ? lineWidth - 1 : endX;
+                                        }
+                                        else {
+                                                break;
+                                        }
+                                }  // fall thru
+
+                        case KEY_UP:
+                                if (--y < 0) {
+                                        y = endY;
+
+                                        if (x > endX) {
+                                                --y;
+                                        }
+                                }
+                                break;
+
+                        default: {
+                                short newByte = -1;
+
+                                if (key == KEY_RETURN && other && other->dataSize > (cur - outOffset * lineWidth)) {
+                                        newByte = other->dataF[cur - outOffset * lineWidth];
+
+                                        hiNib = false;  // advance
+                                }
+
+                                else if (ascii && isprint(key)) {
+                                        newByte = key;
+                                }
+
+                                else {
+                                        if (isxdigit(key)) {
+                                                newByte = upCase(key) - (isdigit(key) ? 48 : 55);
+
+                                                if (hiNib) {
+                                                        newByte <<= 4;
+                                                }
+
+                                                newByte |= editBytes[cur] & (hiNib ? 0x0F : 0xF0);
+                                        }
+                                }
+
+                                if (newByte < 0) {
+                                        break;
+                                }
+
+                                changed = true;
+
+                                editBytes[cur] = newByte;
+
+                                editColor[cur] = (cur < dataSize && dataF[cur] == newByte) ? 0 : cEdit;
+                        }  // fall thru
+
+                        case KEY_RIGHT:
+                                if (hiNib && ! ascii) {
+                                        hiNib = false;
+                                        break;
+                                }
+
+                                hiNib = true;
+
+                                if (++x == lineWidth) {
+                                        x = 0;
+                                }
+
+                                if (y == endY && x > endX) {
+                                        x = 0;
+                                }
+
+                                if (x) {
+                                        break;
+                                }  // fall thru
+
+                        case KEY_DOWN:
+                                if (++y > endY) {
+                                        y = 0;
+                                }
+
+                                if (y == endY && x > endX) {
+                                        y = 0;
+                                }
+                }
+        }
+
+done:
+        if (changed) {
+                changed = false;
+
+                int size = editBytes.size();
+                Byte buf[size];
+
+                for (int i=0; i < size; ++i) {
+                        buf[i] = editBytes[i];
+                }
+
+                if (size == dataSize) {
+                        if (! memcmp(buf, dataF, size)) {
+                                goto done;
+                        }
+                }
+
+                if (! sizeTera && filesize + size - dataSize > 68719476736) {  // very special case
+                        hideCursor();
+                        positionInWin(two ? cmgGotoBottom : cmgGotoTop, 1+ 14 +1, "", 5);
+
+                        mvwaddstr(winInput, 2, 1, "  File >64GB  ");
+                        wgetch(winInput);
+                        goto done;
+                }
+
+                positionInWin(two ? cmgGotoBottom : cmgGotoTop, 1+ 19 +3+1, "");
+
+                mvwaddstr(winInput, 1, 1, " Save changes [y]: ");
+
+                key = wgetch(winInput);
+
+                if (upCase(key) != 'Y') {
+                        goto done;
+                }
+
+                wechochar(winInput, key);
+                napms(500);
+
+                bool ret = false;
+
+                close(fd);
+                fd = OpenFile(fileName, true);
+
+                SeekFile(fd, offset);
+
+                if (size == dataSize) {
+                        ret = WriteFile(fd, buf, dataSize);
+
+                        progress1();
+                }
+
+                else if (size < dataSize) {
+                        if (assure()) {
+                                if (WriteFile(fd, buf, size)) {
+                                        ret = WriteTail(size * -1);
+                                }
+                        }
+                }
+
+                else {  // size > dataSize
+                        if (assure()) {
+                                SeekFile(fd, 0, SEEK_END);
+
+                                if (WriteFile(fd, buffer, size - dataSize)) {  // check
+                                        if (WriteTail(size)) {
+                                                SeekFile(fd, offset);
+
+                                                ret = WriteFile(fd, buf, size);
+                                        }
+                                }
+                        }
+                }
+
+                if (ret) {
+                        if (fsync(fd) == OK) {
+                                if (close(fd) == ERR) {  // seamless error tracking
+                                        ret = false;
+                                }
+
+                                fd = -1;
+                        }
+                        else {
+                                ret = false;
+                        }
+                }
+
+                if (fd > 0) {
+                        close(fd);
+                }
+
+                fd = OpenFile(fileName);
+
+                filesize = SeekFile(fd, 0, SEEK_END);
+
+                move(0);
+
+                updateF();
+
+                if (ret) {
+                        positionInWin(two ? cmgGotoBottom : cmgGotoTop,
+                                1+ (*bufTimer ? strlen(bufTimer) : 11) +1, "", *bufTimer ? 7 : 5);
+
+                        mvwaddstr(winInput, 2, *bufTimer ? (strlen(bufTimer) - 11) / 2 + 1 : 1, "  Success  ");
+
+                        if (*bufTimer) {
+                                mvwaddstr(winInput, 4, 1, bufTimer);
+                                wgetch(winInput);
+
+                                *bufTimer = 0;
+                        }
+                        else {
+                                wrefresh(winInput);
+                                napms(900);
+                        }
+                }
+
+                else {
+                        positionInWin(two ? cmgGotoBottom : cmgGotoTop, 1+ 11 +1, "", 5);
+
+                        mvwaddstr(winInput, 2, 1, "  Failed!  ");
+                        wgetch(winInput);
+                }
+        }
+
+        else {
+                hideCursor();
+        }
+} // end FileDisplay::edit
 
 //--------------------------------------------------------------------
 // Jump a specific percentage forward / backward
 
-void FileDisplay::skip(bool upwards)
+void FileDisplay::skip(bool upwards=false)
 {
         FPos step = filesize / 100;
 
-        if (upwards)
+        if (upwards) {
                 move(step * -skipBack);
-        else
+        }
+        else {
                 move(step * skipForw);
+        }
 }
 
 //--------------------------------------------------------------------
@@ -1127,7 +1866,7 @@ void FileDisplay::skip(bool upwards)
 
 void FileDisplay::sync(const FileDisplay* other)
 {
-        if (other->bufContents) {
+        if (other->dataSize) {
                 moveTo(other->offset);
         }
         else {
@@ -1136,139 +1875,212 @@ void FileDisplay::sync(const FileDisplay* other)
 }
 
 //--------------------------------------------------------------------
-// Change the file position   ##:to
+// Change the file position  ##:to
 
 void FileDisplay::moveTo(FPos newOffset)
 {
-        offset = newOffset;
-
-        if (offset < 0) {
+        if (newOffset < 0) {
                 offset = 0;
         }
-        if (offset > filesize) {
+        else if (newOffset > filesize) {
                 offset = filesize;
+        }
+        else {
+                offset = newOffset;
         }
 
         SeekFile(fd, offset);
 
-        bufContents = ReadFile(fd, dataF, bufSize);
-}
-
-//--------------------------------------------------------------------
-// Move to the end of the file
-
-void FileDisplay::moveToEnd()
-{
-        FPos end = filesize - steps[cmmMovePage];
-
-        moveTo(end);
+        dataSize = ReadFile(fd, dataF, bufSize);
 }
 
 //--------------------------------------------------------------------
 // Change the file position by searching
 
-void FileDisplay::moveTo(const Byte* searchFor, int searchLen)
+void FileDisplay::moveForw(const Byte* searchFor, Size searchLen)
 {
-        if (stopRead) return;
+        FPos newPos = searchOff > 0 ? searchOff + 1 : (searchOff < 0 ? 1 : offset);
+        Full leader = *searchFor;
 
-        const int blockSize = 2 * 1024 * 1024;
-        Byte *const searchBuf = new Byte[blockSize + searchLen];
+        for (Size i=0; i < 7; ++i) {
+                leader = leader << 8 | *searchFor;
+        }
 
-        FPos newPos = searchOff ? searchOff : offset;
-        if (advance) ++newPos;
-        SeekFile(fd, newPos);
-        int bytesRead = ReadFile(fd, searchBuf + searchLen, blockSize);
+        for (;;) {
+                SeekFile(fd, newPos);
+                Size bytesRead = ReadFile(fd, buffer, staticSize);
 
-        if (ignoreCase) { lowerCase(searchBuf + searchLen, bytesRead); }
+                if (bytesRead < searchLen || stopRead) {
+                        break;
+                }
 
-        for (int l = searchLen; bytesRead > 0; l = 0) {  // adjust for first block
-                for (int i=0; i <= bytesRead - l; ++i) {
-                        if (*searchFor == searchBuf[l + i]) {
-                                if (! memcmp(searchFor, searchBuf + l + i, searchLen)) {
-                                        delete [] searchBuf;
-                                        newPos = newPos + i - searchLen + l;
-                                        if (searchIndent && newPos >= searchIndent) {
-                                                searchOff = newPos;
-                                                moveTo(newPos - searchIndent);
-                                        }
-                                        else {
-                                                searchOff = 0;
-                                                moveTo(newPos);
-                                        }
-                                        se4rch = searchLen;
-                                        advance = true;
-                                        return;
+                if (ignoreCase) {
+                        lowCase(buffer, bytesRead);
+                }
+
+                for (Size i=0; i <= bytesRead - searchLen; ++i) {
+                        Full turbo = *(Full*) (buffer + i);
+
+                        if (! turbo) {  // special case
+                                if (leader) {
+                                        goto incr;
+                                }
+                                else {
+                                        goto skip;  // avoid this!
                                 }
                         }
+
+                        turbo ^= leader;
+
+                        if      (! (turbo & 0x00000000000000FF)) { i += 0; }
+                        else if (! (turbo & 0x000000000000FF00)) { i += 1; }
+                        else if (! (turbo & 0x0000000000FF0000)) { i += 2; }
+                        else if (! (turbo & 0x00000000FF000000)) { i += 3; }
+                        else if (! (turbo & 0x000000FF00000000)) { i += 4; }
+                        else if (! (turbo & 0x0000FF0000000000)) { i += 5; }
+                        else if (! (turbo & 0x00FF000000000000)) { i += 6; }
+                        else if (! (turbo & 0xFF00000000000000)) { i += 7; }
+                        else {
+incr:                           i += 7;
+cont:                           continue;
+                        }
+
+skip:                   if (searchFor[searchLen - 1] == buffer[i + searchLen - 1]) {
+                                Size j = 0;
+                                for (; j + 7 < searchLen; j+=8) {
+                                        if (*(Full*) (searchFor  + j) !=
+                                            *(Full*) (buffer + i + j)) {
+                                                goto cont;
+                                        }
+                                }
+
+                                if (searchLen != j) {  // shl mask 63
+                                        if ((*(Full*) (searchFor  + j) ^
+                                             *(Full*) (buffer + i + j) )
+                                             << 8 * (8 - searchLen + j)) {
+                                                goto cont;
+                                        }
+                                }
+
+                                if (i > bytesRead - searchLen) {  // limit turbo
+                                        goto cont;
+                                }
+
+                                newPos    = newPos + i;
+                                searchOff = newPos ? newPos : -1;  // tri-state
+                                se4rch    = searchLen;
+
+                                moveTo(newPos - (searchOff >= searchIndent ? searchIndent : 0));
+                                return;
+                        }
                 }
-                if (stopRead) { break; }
 
-                newPos += blockSize;
-                memcpy(searchBuf, searchBuf + blockSize, searchLen);
-                bytesRead = ReadFile(fd, searchBuf + searchLen, blockSize);
-                if (ignoreCase) { lowerCase(searchBuf + searchLen, bytesRead); }
+                newPos += staticSize - searchLen + 1;
         }
-        advance = false;
-        delete [] searchBuf;
 
-        stopRead ? moveTo(newPos) : moveToEnd();
-} // end FileDisplay::moveTo
+        moveTo(stopRead ? newPos : filesize);
+
+        searchOff = 0;
+} // end FileDisplay::moveForw
 
 //--------------------------------------------------------------------
-// Change the file position by searching backward
+// Change the file position by searching backwards
 
-void FileDisplay::moveToBack(const Byte* searchFor, int searchLen)
+void FileDisplay::moveBack(const Byte* searchFor, Size searchLen)
 {
-        if (stopRead) return;
+        FPos newPos = searchOff > 0 ? searchOff : offset;
+        Full leader = *searchFor;
 
-        const int blockSize = 8 * 1024 * 1024;
-        Byte *const searchBuf = new Byte[blockSize + searchLen];
-        FPos newPos = (searchOff ? searchOff : offset) - blockSize;
-        memcpy(searchBuf + blockSize, dataF + (searchOff ? searchIndent : 0), searchLen);
-        int diff = 0, bytesRead;
+        for (Size i=0; i < 7; ++i) {
+                leader = leader << 8 | *searchFor;
+        }
 
-        for (int l=advance ? 0 : 1; ; l=0) {
-                if (newPos < 0) { diff = newPos; newPos = 0; }
-                SeekFile(fd, newPos);
-                if ((bytesRead = ReadFile(fd, searchBuf, blockSize)) <= 0) break;
+        if (newPos + searchLen - 1 > filesize) {
+                newPos = filesize - searchLen + 1;
+        }
 
-                if (ignoreCase) { lowerCase(searchBuf, bytesRead); }
+        for (;;) {
+                newPos -= staticSize - searchLen + 1;
 
-                if (diff) memmove(searchBuf + (blockSize + diff), searchBuf + blockSize, searchLen);
+                SeekFile(fd, newPos > 0 ? newPos : 0);
+                Size bytesRead = ReadFile(fd, buffer, staticSize);
 
-                for (int i = blockSize - 1 + diff + l; i >= 0; --i) {
-                        if (*searchFor == searchBuf[i]) {
-                                if (! memcmp(searchFor, searchBuf + i, searchLen)) {
-                                        delete [] searchBuf;
-                                        newPos = newPos + i;
-                                        if (searchIndent && newPos >= searchIndent) {
-                                                searchOff = newPos;
-                                                moveTo(newPos - searchIndent);
-                                        }
-                                        else { searchOff = 0; moveTo(newPos); }
-                                        se4rch = searchLen;
-                                        advance = true;
-                                        return;
+                if (ignoreCase) {
+                        lowCase(buffer, bytesRead);
+                }
+
+                for (Size i = staticSize + (newPos < 0 ? newPos : 0) - searchLen; i >= 0; --i) {
+                        Full turbo = *(Full*) (buffer + i - 7);
+
+                        if (! turbo) {
+                                if (leader) {
+                                        goto decr;
+                                }
+                                else {
+                                        goto skip;  // avoid this!
                                 }
                         }
-                }
-                if (! newPos || stopRead) break;
 
-                memcpy(searchBuf + blockSize, searchBuf, searchLen);
-                newPos -= blockSize;
+                        turbo ^= leader;
+
+                        if      (! (turbo & 0xFF00000000000000)) { i -= 0; }
+                        else if (! (turbo & 0x00FF000000000000)) { i -= 1; }
+                        else if (! (turbo & 0x0000FF0000000000)) { i -= 2; }
+                        else if (! (turbo & 0x000000FF00000000)) { i -= 3; }
+                        else if (! (turbo & 0x00000000FF000000)) { i -= 4; }
+                        else if (! (turbo & 0x0000000000FF0000)) { i -= 5; }
+                        else if (! (turbo & 0x000000000000FF00)) { i -= 6; }
+                        else if (! (turbo & 0x00000000000000FF)) { i -= 7; }
+                        else {
+decr:                           i -= 7;
+cont:                           continue;
+                        }
+
+skip:                   if (searchFor[searchLen - 1] == buffer[i + searchLen - 1]) {
+                                Size j = 0;
+                                for (; j + 7 < searchLen; j+=8) {
+                                        if (*(Full*) (searchFor  + j) !=
+                                            *(Full*) (buffer + i + j)) {
+                                                goto cont;
+                                        }
+                                }
+
+                                if (searchLen != j) {
+                                        if ((*(Full*) (searchFor  + j) ^
+                                             *(Full*) (buffer + i + j) )
+                                             << 8 * (8 - searchLen + j)) {
+                                                goto cont;
+                                        }
+                                }
+
+                                if (i < 0) {
+                                        goto cont;
+                                }
+
+                                newPos    = (newPos > 0 ? newPos : 0) + i;
+                                searchOff = newPos ? newPos : -1;
+                                se4rch    = searchLen;
+
+                                moveTo(newPos - (searchOff >= searchIndent ? searchIndent : 0));
+                                return;
+                        }
+                }
+
+                if (newPos <= 0 || stopRead) {
+                        break;
+                }
         }
-        advance = false;
-        delete [] searchBuf;
+
         moveTo(stopRead ? newPos : 0);
-} // end FileDisplay::moveToBack
+
+        searchOff = 0;
+} // end FileDisplay::moveBack
 
 //--------------------------------------------------------------------
 // Seek to next byte not equal to current head
 
-void FileDisplay::seekNotChar(bool upwards)
+void FileDisplay::seekNotChar(bool upwards=false)
 {
-        if (stopRead) return;
-
         const int blockSize = 1024 * 1024;
         Byte *const searchBuf = new Byte[blockSize];
 
@@ -1329,7 +2141,7 @@ void FileDisplay::smartScroll()
                 scrollOff = 0;
                 moveTo(newPos);
 
-                if (! bufContents) {
+                if (! dataSize) {
                         moveToEnd();
                 }
                 return;
@@ -1346,21 +2158,28 @@ void FileDisplay::smartScroll()
         int bytesRead = ReadFile(fd, scrollBuf, blockSize);
 
         memcpy(dataF, scrollBuf, lineWidth);
-        if (modeAscii)
-                for (int k=0; k < lineWidth; ++k)
-                        if (! isprint(dataF[k]))
-                                dataF[k] = ' ';
         bytesRead -= lineWidth;
 
+        if (modeAscii) {
+                for (int i=0; i < lineWidth; ++i) {
+                        if (! isprint(dataF[i])) {
+                                dataF[i] = ' ';
+                        }
+                }
+        }
+
         int i = 1, j = 1;
-        for ( ; bytesRead > 0; ) {
+        for (; bytesRead > 0;) {
                 if (bytesRead >= lineWidth) {
                         memcpy(buf, scrollBuf + j * lineWidth, lineWidth);
 
-                        if (modeAscii)
-                                for (int k=0; k < lineWidth; ++k)
-                                        if (! isprint(buf[k]))
+                        if (modeAscii) {
+                                for (int k=0; k < lineWidth; ++k) {
+                                        if (! isprint(buf[k])) {
                                                 buf[k] = ' ';
+                                        }
+                                }
+                        }
 
                         if (memcmp(dataF + (i - 1) * lineWidth, buf, lineWidth)) {
                                 memcpy(dataF + i * lineWidth, buf, lineWidth);
@@ -1369,7 +2188,8 @@ void FileDisplay::smartScroll()
                                 repeat = 0;
                                 ++i;
 
-                        } else {
+                        }
+                        else {
                                 ++repeat;
                         }
 
@@ -1397,7 +2217,9 @@ void FileDisplay::smartScroll()
                                         break;
                                 }
 
-                        } else {
+                        }
+
+                        else {
                                 if (repeat) {
                                         *(addr + i) = --repeat;
 
@@ -1408,612 +2230,359 @@ void FileDisplay::smartScroll()
                 }
         }
 
+        /* Gosh! All 4 exit points land here. */
         scrollOff = newPos + j * lineWidth;
 
-        bufContents = i * lineWidth + min(bytesRead, lineWidth);
+        dataSize = i * lineWidth + min(bytesRead, lineWidth);
 
         delete [] scrollBuf;
 } // end FileDisplay::smartScroll
 
 //====================================================================
+// Class InputManager
+
+class InputManager
+{
+    private:
+        char           *buf;
+        const char     *restrictChar;
+        StrDeq         &history;
+        size_t          historyPos;
+        string          historyInp;
+        int             maxLen;
+        int             step;
+        int             len = 0;
+        int             cur = 0;
+        bool            upcase;
+        bool            splitHex;
+        bool            overStrike = false;
+
+    private:
+        void    useHistory(int delta);
+
+    public:
+                InputManager(char* Buf, int MaxLen, StrDeq& History):
+                        buf(Buf), history(History), historyPos(History.size()), maxLen(MaxLen) {}
+               ~InputManager()                          {}
+
+        void    setCharacters(const char* RestrictChar) { restrictChar = RestrictChar; }
+        void    setSplitHex(bool SplitHex)              { splitHex = SplitHex; }
+        void    setUpcase(bool Upcase)                  { upcase = Upcase; }
+        void    setStep(int Step)                       { step = Step; }
+
+        void    run();
+}; // end InputManager
+
+//====================================================================
 // Class InputManager member functions
-
-InputManager::InputManager(char* aBuf, int aMaxLen, StrDeq& aHistory)
-: buf(aBuf),
-  restrictChar(NULL),
-  history(aHistory),
-  historyPos(aHistory.size()),
-  maxLen(aMaxLen),
-  len(0),
-  i(0),
-  upcase(false),
-  splitHex(false),
-  insert(true)
-{
-}
-
-//--------------------------------------------------------------------
-// Normalize the string in the input window
-
-bool InputManager::normalize(int pos)
-{
-  if (!splitHex) return false;
-
-  // Change D_ to 0D:
-  if (pos && buf[pos] == ' ' && buf[pos-1] != ' ') {
-    buf[pos] = buf[pos-1];
-    buf[pos-1] = '0';
-    if (pos == len) len += 2;
-    return true;
-  }
-
-  // Change _D to 0D:
-  if (pos < len && buf[pos] == ' ' && buf[pos+1] != ' ') {
-    buf[pos] = '0';
-    return true;
-  }
-
-  return false;                 // No changes necessary
-}
 
 //--------------------------------------------------------------------
 // Switch the current input line with one from the history
-//
-// Input:
-//   delta:  The number to add to historyPos (-1 previous, +1 next)
 
 void InputManager::useHistory(int delta)
 {
-  // Clean up the current string if necessary:
-  normalize(i);
+        if (historyPos == history.size()) {
+                historyInp.assign(buf, len);
+        }
 
-  // Save the current string
-  if (historyPos == history.size()) {
-    cur.assign(buf, len);
-  }
+        historyPos += delta;
 
-  historyPos += delta;
+        string s = historyPos == history.size() ? historyInp : history[historyPos];
 
-  String s = historyPos == history.size() ? cur : history[historyPos];
+        cur = len = s.size();
 
-  // Store the new string in the buffer:
-  memset(buf, ' ', maxLen);
-  i = len = min(maxLen, (int) s.length());
-  memcpy(buf, s.c_str(), len);
-} // end InputManager::useHistory
+        memset(buf, ' ', maxLen);
+
+        memcpy(buf, s.data(), len);
+}
 
 //--------------------------------------------------------------------
-// Run the main loop to get an input string
+// Run the main loop to get an input string  ##:run
 
-bool InputManager::run()
+void InputManager::run()
 {
-  wmove(winInput, 1, 2);
+        memset(buf, ' ', maxLen);
+        buf[maxLen] = 0;
 
-  bool  done   = false;
-  bool  aborted = true;
+        showCursor();
 
-  ConWindow::showCursor(insert);
+        for (;;) {
+                mvwaddstr(winInput, 1, 2, buf);
+                wmove(winInput, 1, 2 + cur);
 
-  memset(buf, ' ', maxLen);
-  buf[maxLen] = '\0';
+                int key = wgetch(winInput);
 
-  // We need to be able to display complete bytes:
-  if (splitHex && (maxLen % 3 == 1)) --maxLen;
+                if (upcase) {
+                        key = upCase(key);
+                }
 
-  // Main input loop:
-  while (!done) {
-    mvwaddstr(winInput, 1, 2, buf);
-    wmove(winInput, 1, 2 + i);
-    int key = wgetch(winInput);
-    if (upcase) key = safeUC(key);
+                if (isprint(key)) {
+                        if (restrictChar && ! strchr(restrictChar, key)) {
+                                continue;
+                        }
 
-    switch (key) {
-     case KEY_ESCAPE:  buf[0] = '\0';  done = true;  break; // ESC
+                        if (overStrike) {
+                                if (cur >= maxLen) {
+                                        continue;
+                                }
+                        }
 
-     case KEY_RETURN:           // Enter
-      normalize(i);
-      buf[len] = '\0';
-      done = true;
-      aborted = false;
-      break;
+                        else {
+                                if (! (cur % step)) {
+                                        if (len + step > maxLen) {
+                                                continue;
+                                        }
 
-     case KEY_BACKSPACE:
-     case KEY_DELETE:           // Backspace on most Unix terminals
-     case 0x08:                 // Backspace (Ctrl-H)
-      if (!i) continue; // Can't back up if we're at the beginning already
-      historyPos = history.size();
-      if (splitHex) {
-        if ((i % 3) == 0) {
-          // At the beginning of a byte; erase last digit of previous byte:
-          if (i == len) len -= 2;
-          i -= 2;
-          buf[i] = ' ';
-        } else if (i < len && buf[i] != ' ') {
-          // On the second digit; erase the first digit:
-          buf[--i] = ' ';
-        } else {
-          // On a blank second digit; delete the entire byte:
-          buf[--i] = ' ';
-          memmove(buf + i, buf + i + 3, maxLen - i - 3);
-          len -= 3;
-          if (len < i) len = i;
+                                        if (cur != len) {  // true insert
+                                                memmove(buf + cur + step, buf + cur, len - cur);
+
+                                                len += step;
+
+                                                if (splitHex) {
+                                                        buf[cur + 1] = ' ';
+                                                }
+                                        }
+                                }
+                        }
+
+                        mEdit
+
+                        buf[cur++] = key;
+
+                        if (splitHex && cur % 3 == 2) {
+                                ++cur;
+                        }
+
+                        if (cur > len) {
+                                len = cur;
+                        }
+                }
+
+                else {
+                        if (key == KEY_IC) {
+                                overStrike ^= true;
+                                showCursor(overStrike);
+                                continue;
+                        }
+
+                        if (splitHex && cur) {  // normalize
+                                if (buf[cur] == ' ' && buf[cur - 1] != ' ') {
+                                        buf[cur]     = buf[cur - 1];
+                                        buf[cur - 1] = '0';
+
+                                        if (cur == len) {
+                                                len += 2;
+                                        }
+                                }
+
+                                cur -= cur % step;
+                        }
+
+                        switch (key) {
+                                case KEY_ESCAPE:
+                                case KEY_RETURN:
+                                        buf[key == KEY_RETURN ? len : 0] = 0;
+                                        goto done;
+
+                                case KEY_LEFT:
+                                case KEY_RIGHT:
+                                        if (key == KEY_LEFT ? cur : cur < len) {
+                                                cur = cur + (key == KEY_LEFT ? -step : step);
+                                        }
+                                        break;
+
+                                case KEY_HOME:
+                                case KEY_END:
+                                        cur = key == KEY_END ? len : 0;
+                                        break;
+
+                                case KEY_UP:
+                                        if (historyPos) {
+                                                useHistory(-1);
+                                        }
+                                        break;
+
+                                case KEY_DOWN:
+                                        if (historyPos < history.size()) {
+                                                useHistory(+1);
+                                        }
+                                        break;
+
+                                case KEY_DC:
+                                        if (cur >= len) {
+                                                continue;
+                                        }
+
+                                        mEdit
+
+                                        memmove(buf + cur, buf + cur + step, len - cur - step);
+                                        memset(buf + len - step, ' ', step);
+
+                                        len -= step;
+                                        break;
+
+                                case KEY_BACKSPACE:
+                                        if (! cur) {
+                                                continue;
+                                        }
+
+                                        mEdit
+
+                                        memmove(buf + cur - step, buf + cur, len - cur);
+                                        memset(buf + len - step, ' ', step);
+
+                                        cur -= step;
+                                        len -= step;
+                                        break;
+
+                                case KEY_CTRL_U:  // unix-line-discard
+                                        mEdit
+
+                                        memmove(buf, buf + cur, len - cur);
+                                        memset(buf + len - cur, ' ', cur);
+
+                                        len -= cur;
+                                        cur = 0;
+                                        break;
+
+                                case KEY_CTRL_K:  // kill-line
+                                        mEdit
+
+                                        memset(buf + cur, ' ', len - cur);
+                                        len = cur;
+                        }
+                }
         }
-      } else { // not splitHex mode
-        memmove(buf + i - 1, buf + i, maxLen - i);
-        buf[maxLen-1] = ' ';
-        --len;  --i;
-      } // end else not splitHex mode
-      break;
 
-     case 0x04:                 // Ctrl-D
-     case KEY_DC:
-      if (i >= len) continue;
-      historyPos = history.size();
-      if (splitHex) {
-        i -= i%3;
-        memmove(buf + i, buf + i + 3, maxLen - i - 3);
-        len -= 3;
-        if (len < i) len = i;
-      } else {
-        memmove(buf + i, buf + i + 1, maxLen - i - 1);
-        buf[maxLen-1] = ' ';
-        --len;
-      } // end else not splitHex mode
-      break;
+done:
+        hideCursor();
 
-     case KEY_IC:
-      insert = !insert;
-      ConWindow::showCursor(insert);
-      break;
+        if (*buf) {
+                for (auto exists = history.begin(); exists != history.end(); ++exists) {
+                        if (*exists == buf) {
+                                history.erase(exists);
+                                break;
+                        }
+                }
 
-     case 0x02:                 // Ctrl-B
-     case KEY_LEFT:
-      if (i) {
-        --i;
-        if (splitHex) {
-          normalize(i+1);
-          if (i % 3 == 2) --i;
+                if (history.size() == maxHistory) {
+                        history.pop_front();
+                }
+
+                history.push_back(buf);
         }
-      }
-      break;
 
-     case 0x06:                 // Ctrl-F
-     case KEY_RIGHT:
-      if (i < len) {
-        ++i;
-        if (splitHex) {
-          normalize(i-1);
-          if ((i < maxLen) && (i % 3 == 2)) ++i;
-        }
-      }
-      break;
-
-     case 0x15:                 // Ctrl-U
-      if (i) {
-        historyPos = history.size();
-        if (splitHex) {
-          i -= i % 3;
-        }
-        int tail = len - i;
-        memmove(buf, buf + i, tail);
-        memset(buf + tail, ' ', maxLen - tail);
-        len = tail;
-        i = 0;
-      }
-      break;
-
-     case 0x0B:                 // Ctrl-K
-      if (len > i) {
-        historyPos = history.size();
-        if (splitHex) {
-          i -= i % 3;
-        }
-        memset(buf + i, ' ', len - i);
-        len = i;
-      }
-      break;
-
-     case 0x01:                 // Ctrl-A
-     case KEY_HOME:
-      normalize(i);
-      i = 0;
-      break;
-
-     case 0x05:                 // Ctrl-E
-     case KEY_END:
-      if (splitHex && (i < len))
-        normalize(i);
-      i = len;
-      break;
-
-     case 0x10:                 // Ctrl-P
-     case KEY_UP:
-      if (historyPos)
-        useHistory(-1);
-      break;
-
-     case 0x0E:                 // Ctrl-N
-     case KEY_DOWN:
-      if (historyPos < history.size())
-        useHistory(+1);
-      break;
-
-     default:
-      if (isprint(key) && (!restrictChar || strchr(restrictChar, key))) {
-        if (insert) {
-          if (splitHex) {
-            if (buf[i] == ' ') {
-              if (i >= maxLen) continue;
-            } else {
-              if (len >= maxLen) continue;
-              i -= i % 3;
-              memmove(buf + i + 3, buf + i, maxLen - i - 3);
-              buf[i+1] = ' ';
-              len += 3;
-            }
-          } // end if splitHex mode
-          else {
-            if (len >= maxLen) continue;
-            memmove(buf + i + 1, buf + i, maxLen - i - 1);
-            ++len;
-          } // end else not splitHex mode
-        } else { // overstrike mode
-          if (i >= maxLen) continue;
-        } // end else overstrike mode
-        historyPos = history.size();
-        buf[i++] = key;
-        if (splitHex && (i < maxLen) && (i % 3 == 2))
-          ++i;
-        if (i > len) len = i;
-      } // end if is acceptable character to insert
-    } // end switch key
-  } // end while not done
-
-  // Hide the input window & cursor:
-  ConWindow::hideCursor();
-
-  // Record the result in the history:
-  if (!aborted && len) {
-    auto exists = history.begin();
-
-    for (; exists != history.end(); ++exists) {
-            if (*exists == buf) break;
-    }
-    if (exists != history.end()) {
-      history.erase(exists);
-    }
-    if (history.size() == maxHistory) {
-      history.pop_front();
-    }
-    history.push_back(buf);
-  } // end if we have a value to store in the history
-
-  return !aborted;
+        return;
 } // end InputManager::run
 
 //====================================================================
-// Global Functions
-
-void setViewMode()
-{
-        lineWidth = modeAscii ? lineWidthAsc : lineWidthAsc / 4;
-
-        bufSize = numLines * lineWidth;
-
-        searchIndent = lineWidth * 3;
-
-        steps[cmmMoveByte] = 1;
-        steps[cmmMoveLine] = lineWidth;
-        steps[cmmMovePage] = bufSize - lineWidth;
-        steps[cmmMoveAll]  = 0;
-}
-
-void calcScreenLayout()  // ##:y
-{
-        if (COLS < minScreenWidth) {
-                string err("The screen must be at least " + to_string(minScreenWidth) + " characters wide.");
-
-                exitMsg(2, err.c_str());
-        }
-
-        if (LINES < minScreenHeight) {
-                string err("The screen must be at least " + to_string(minScreenHeight) + " lines high.");
-
-                exitMsg(3, err.c_str());
-        }
-
-        // use large addresses only if needed
-        short tera = sizeTera ? 3 : 0;
-
-        leftMar = 11 + tera;
-
-        if (COLS >= 140 + tera) {
-                lineWidth   = 32;
-                screenWidth = 140 + tera;
-                leftMar2    = 108 + tera;
-        }
-        else if (COLS >= 108 + tera) {
-                lineWidth   = 24;
-                screenWidth = 108 + tera;
-                leftMar2    = 84  + tera;
-        }
-        else {
-                lineWidth   = 16;
-                screenWidth = 76 + tera;
-                leftMar2    = 60 + tera;
-        }
-
-        lineWidthAsc = lineWidth * 4;
-
-        inWidth = (sizeTera ? 15 : 11) + 1;  // sign
-
-        linesTotal = LINES;
-
-        numLines = LINES / (singleFile ? 1 : 2) - 1;
-
-        setViewMode();
-} // end calcScreenLayout
+// Global Functions which uses Objects
 
 //--------------------------------------------------------------------
-// Convert a character to uppercase
+// Get a string using InputManager
 
-int safeUC(int c)
+void getString(char* buf, int maxlen, StrDeq& history,
+                        const char* restrictChar=NULL, bool upcase=false, bool splitHex=false)
 {
-  return (c >= 0 && c <= UCHAR_MAX) ? toupper(c) : c;
+        InputManager manager(buf, maxlen, history);
+
+        manager.setCharacters(restrictChar);
+        manager.setSplitHex(splitHex);
+        manager.setUpcase(upcase);
+        manager.setStep(splitHex ? 3 : 1);
+
+        manager.run();
 }
 
 //--------------------------------------------------------------------
-// Convert buffer to lowercase
+// Program setup  ##:s
 
-void lowerCase(Byte *buf, int len)
-{
-        for (int i=0; i < len; ++i) {
-                if (buf[i] >= 'A' && buf[i] <= 'Z') {
-                        buf[i] |= 0x20;
-                }
-        }
-}
-
-//--------------------------------------------------------------------
-// my pretty printer
-
-char *pretty (char *buffer, FPos *size, int sign)
-{
-        char aBuf[50];
-        char *pa = aBuf, *pb = buffer;
-
-        if (sign)
-                sprintf (aBuf, "%+ld", *size);
-        else
-                sprintf (aBuf, "%ld", *size);
-
-        int len = strlen (aBuf);
-
-        while (len) {
-                *pb++ = *pa++;
-
-                if (sign) { --sign; --len; }
-
-                else if (--len && ! (len % 3))
-                        if (thouSep)
-                                *pb++ = thouSep;
-        }
-        *pb = '\0';
-
-        return buffer;
-}
-
-//--------------------------------------------------------------------
-// Get a string using winInput
-
-void getString(char* buf, int maxLen, StrDeq& history,
-               const char* restrictChar=NULL,
-               bool upcase=false, bool splitHex=false)
-{
-  InputManager  manager(buf, maxLen, history);
-
-  manager.setCharacters(restrictChar);
-  manager.setSplitHex(splitHex);
-  manager.setUpcase(upcase);
-
-  manager.run();
-}
-
-//--------------------------------------------------------------------
-// Move help window in stack
-
-void displayHelp()
-{
-        touchwin(winHelp);
-        wrefresh(winHelp);
-        wgetch(winHelp);
-}
-
-//--------------------------------------------------------------------
-// Print a message to stderr and exit
-
-void exitMsg(int status, const char* message)
-{
-  ConWindow::shutdownW();
-
-  fprintf(stderr, "\n %s\n", message);
-  exit(status);
-}
-
-//--------------------------------------------------------------------
-// Convert hex string to bytes
-
-int packHex(Byte* buf)
-{
-  FPos val;
-
-  char* in  = reinterpret_cast<char*>(buf);
-  Byte* out = buf;
-
-  while (*in) {
-    if (*in == ' ')
-      ++in;
-    else {
-      val = strtoull(in, &in, 16);
-      *(out++) = Byte(val);
-    }
-  }
-
-  return out - buf;
-}
-
-//--------------------------------------------------------------------
-// Position the input window
-
-void positionInWin(Command cmd, short width, const char* title)
-{
-        if (wresize(winInput, 3, width) != OK) {
-                exitMsg(94, "Internal error: Failed to resize window");
-        }
-
-        wbkgd(winInput, attribStyle[cWindowBold]);
-        werase(winInput);
-
-        mvwin(winInput,
-                ((! singleFile && (cmd & cmgGotoBottom))
-                      ? ((cmd & cmgGotoTop)
-                              ? numLines                  // Moving both
-                              : numLines + numLines / 2)  // Moving bottom
-                      : (numLines - 1 ) / 2),             // Moving top
-                 (screenWidth - width) / 2);
-
-        box(winInput, 0, 0);
-
-        mvwaddstr(winInput, 0, (width - strlen(title)) / 2, title);
-}
-
-//--------------------------------------------------------------------
-// Initialize program   ##:i
-
-void initialize()
+void setup()
 {
         calcScreenLayout();  // global vars
 
-        if ((winInput = newwin(3, inWidth, 0, 0)) == 0) {
-                exitMsg(92, "Internal error: Failed to create window");
+        if (! (winInput = newwin(3, inWidth, 0, 0))) {
+                exitMsg(22, "Failed to create input window.");
         }
         keypad(winInput, true);
 
-        if ((winHelp = newwin(helpHeight, helpWidth,
+        if (! (winHelp = newwin(helpHeight, helpWidth,
                               1 + (linesTotal - helpHeight) / 3,
-                              1 + (screenWidth - helpWidth) / 2)) == 0) {
-                exitMsg(93, "Internal error: Failed to create window");
+                              1 + (screenWidth - helpWidth) / 2))) {
+                exitMsg(23, "Failed to create help window.");
         }
 
-        wbkgd(winHelp, attribStyle[cWindowBold]);
+        wbkgd(winHelp, attribStyle[cHelpWin]);
         box(winHelp, 0, 0);
 
-        mvwaddstr(winHelp, 0, (helpWidth - 6) / 2, " Help ");
-        mvwaddstr(winHelp, helpHeight - 1, (helpWidth - 20 - (3+1) - 1) / 2, " VBinDiff for Linux " VBL_VERSION " ");
+        mvwaddstr(winHelp, 0,              (helpWidth - 6)                   / 2, " Help ");
+        mvwaddstr(winHelp, helpHeight - 1, (helpWidth - strlen(helpVersion)) / 2, helpVersion);
 
         for (int i=0; i < helpHeight - 2; ++i) {  // exclude border
                 mvwaddstr(winHelp, i + 1, 1, aHelp[i]);
         }
 
         for (int i=0; aBold[i]; i += 2) {
-                mvwchgat(winHelp, aBold[i], aBold[i + 1], 1, attribStyle[cHotKey], colorStyle[cHotKey], NULL);
+                mvwchgat(winHelp, aBold[i], aBold[i + 1], 1, attribStyle[cHotkey], colorStyle[cHotkey], NULL);
         }
 
-        if (! singleFile)
+        if (! singleFile) {
                 diffs.resizeD();
+        }
 
         file1.initF(0, (singleFile ? NULL : &diffs));
 
-        if (! singleFile)
+        if (! singleFile) {
                 file2.initF(numLines + 1, &diffs);
-} // end initialize
-
-//--------------------------------------------------------------------
-// Get a command from the keyboard   ##:get
-
-Command getCommand()
-{
-        Command cmd = cmNothing;
-
-        while (cmd == cmNothing) {
-                int e = file1.readKeyF();
-
-                switch (safeUC(e)) {
-                        case KEY_RIGHT:      cmd = cmmMove | cmmMoveByte | cmmMoveForward; break;
-                        case KEY_DOWN:       cmd = cmmMove | cmmMoveLine | cmmMoveForward; break;
-                        case ' ':            cmd = cmmMove | cmmMovePage | cmmMoveForward; break;
-                        case KEY_END:        cmd = cmmMove | cmmMoveAll  | cmmMoveForward; break;
-                        case KEY_LEFT:       cmd = cmmMove | cmmMoveByte;                  break;
-                        case KEY_UP:         cmd = cmmMove | cmmMoveLine;                  break;
-                        case KEY_BACKSPACE:  cmd = cmmMove | cmmMovePage;                  break;
-                        case KEY_HOME:       cmd = cmmMove | cmmMoveAll;                   break;
-
-                        case 'F':        cmd = cmfFind;                break;
-                        case 'N':        cmd = cmfFind | cmfFindNext;  break;
-                        case 'P':        cmd = cmfFind | cmfFindPrev;  break;
-                        case KEY_NPAGE:  cmd = cmfFind | cmfNotCharDn; break;
-                        case KEY_PPAGE:  cmd = cmfFind | cmfNotCharUp; break;
-
-                        case 'G':  cmd = cmgGoto;               break;
-                        case '+':
-                        case '*':
-                        case '=':  cmd = cmgGoto | cmgGotoForw; break;
-                        case '-':  cmd = cmgGoto | cmgGotoBack; break;
-                        case '\'':
-                        case '<':  cmd = cmgGoto | cmgGotoLast; break;
-                        case '.':  cmd = cmgGoto | cmgGotoLOff; break;
-                        case ',':  cmd = cmgGoto | cmgGotoNOff; break;
-
-                        case 'T':  if (! singleFile) cmd = cmUseTop; break;
-                        case 'B':  if (! singleFile) cmd = cmUseBottom; break;
-
-                        case KEY_RETURN:
-                                if (singleFile)
-                                        cmd = cmSmartScroll;
-                                else
-                                        cmd = cmNextDiff;
-                                break;
-
-                        case '#':
-                        case '\\':  if (! singleFile) cmd = cmPrevDiff; break;
-
-                        case 'E':
-                                if (lockState == lockTop)
-                                        cmd = cmEditBottom;
-                                else
-                                        cmd = cmEditTop;
-                                break;
-
-                        case '1':  if (! singleFile) cmd = cmSyncUp; break;
-                        case '2':  if (! singleFile) cmd = cmSyncDn; break;
-
-                        case 'A':  if (singleFile) cmd = cmShowAscii; break;
-
-                        case 'I':  cmd = cmIgnoreCase; break;
-
-                        case 'R':  cmd = cmShowRaster; break;
-
-                        case 'H':  cmd = cmShowHelp; break;
-
-                        case KEY_ESCAPE:
-                        case KEY_CTRL_C:
-                        case 'Q':  cmd = cmQuit; break;
-                } // end switch ASCII code
-        } // end while no command
-
-        if (cmd & (cmmMove | cmfFind | cmgGoto)) {
-                if (lockState != lockTop)
-                        cmd |= cmgGotoTop;
-
-                if (lockState != lockBottom && ! singleFile)
-                        cmd |= cmgGotoBottom;
         }
-
-        return cmd;
-} // end getCommand
+} // end setup
 
 //--------------------------------------------------------------------
-// Get a file position and move there   ##:p
+// Test progress bar
+
+void ee()
+{
+        for (int blocks = 25, naps = 4, go = 0; ;) {
+                for (int i=1; i;) {
+                        char buf[32];
+                        sprintf(buf, " %d %d ", blocks, naps);
+                        positionInWin(cmgGotoTop, 2+ blocks +2, buf);
+
+                        if (! go++) break;
+
+                        flushinp();
+                        int key = wgetch(winInput);
+
+                        switch (key) {
+                                case KEY_UP:     if (naps < 50) ++naps; break;
+                                case KEY_DOWN:   if (naps >  0) --naps; break;
+
+                                case KEY_LEFT:   if (blocks > 3) --blocks; file1.updateF(); break;
+                                case KEY_RIGHT:  if (blocks < screenWidth - 4) ++blocks;    break;
+
+                                case KEY_ESCAPE:  file1.updateF(); return;
+                                default:          --i;
+                        }
+                }
+
+                wchar_t bar[blocks + 1];
+                memset(bar, 0, sizeof(bar));
+
+                for (int i=0; i < blocks; ++i) {
+                        for (int j=0; j < 8; ++j) {
+                                bar[i] = barSyms[j];
+
+                                mvwaddwstr(winInput, 1, 2, bar);
+                                wrefresh(winInput);
+                                napms(naps);
+                        }
+                }
+                napms(200);
+        }
+}
+
+//--------------------------------------------------------------------
+// Get a file position and move there  ##:p
 
 void gotoPosition(Command cmd)
 {
@@ -2021,12 +2590,14 @@ void gotoPosition(Command cmd)
 
         char buf[inWidth + 1];
 
-        getString(buf, inWidth, positionHistory, hexDigits, true);
-        if (! buf[0]) return;
+        getString(buf, inWidth, positionHistory, hexDigitsGoto);
 
-        FPos pos1 = 0, pos2 = 0;
+        if (! buf[0]) {
+                return;
+        }
 
         int rel = 0;
+
         if (*buf == '+') {
                 ++rel;
         }
@@ -2038,6 +2609,9 @@ void gotoPosition(Command cmd)
         if (rel) {
                 *buf = ' ';
         }
+
+        FPos pos1 = 0,
+             pos2 = 0;
 
         if (strchr(buf, '%')) {
                 int i = atoi(buf);
@@ -2051,39 +2625,55 @@ void gotoPosition(Command cmd)
                         pos2 = file2.filesize - steps[cmmMovePage];
                 }
         }
-        else if (strpbrk(buf, "ABCDEFX")) {
+
+        else if (strpbrk(buf, "ABCDEFXabcdefx")) {
               pos1 = pos2 = strtoull(buf, NULL, 16);
         }
+
         else {
               pos1 = pos2 = strtoull(buf, NULL, 10);
         }
 
-        if (cmd & cmgGotoTop) {
-                file1.setLast();
+        Size prefix = 1;
 
+        const char* ptr = strpbrk(buf, sPrefix);
+
+        if (ptr) {
+                ptr = strchr(sPrefix, *ptr);
+
+                prefix = aPrefix[ptr - sPrefix];
+        }
+
+        pos1 *= prefix;
+        pos2 *= prefix;
+
+        if (cmd & cmgGotoTop) {
                 if (rel) {
                         file1.repeatOff = rel > 0 ? pos1 : -pos1;
                         file1.move(file1.repeatOff);
                 }
+
                 else {
+                        file1.setLast();
                         file1.moveTo(pos1);
                 }
         }
-        if (cmd & cmgGotoBottom) {
-                file2.setLast();
 
+        if (cmd & cmgGotoBottom) {
                 if (rel) {
                         file2.repeatOff = rel > 0 ? pos2 : -pos2;
                         file2.move(file2.repeatOff);
                 }
+
                 else {
+                        file2.setLast();
                         file2.moveTo(pos2);
                 }
         }
 } // end gotoPosition
 
 //--------------------------------------------------------------------
-// Search for text or bytes in the files   ##:s
+// Search for text or bytes in the files
 
 void searchFiles(Command cmd)
 {
@@ -2095,16 +2685,19 @@ void searchFiles(Command cmd)
 
                 mvwaddstr(winInput, 1,  2, "H Hex");
                 mvwaddstr(winInput, 1, 10, "T Text");
-                mvwchgat(winInput, 1,  2, 1, attribStyle[cHotKey], colorStyle[cHotKey], NULL);
-                mvwchgat(winInput, 1, 10, 1, attribStyle[cHotKey], colorStyle[cHotKey], NULL);
+
+                mvwchgat(winInput, 1,  2, 1, attribStyle[cHotkey], colorStyle[cHotkey], NULL);
+                mvwchgat(winInput, 1, 10, 1, attribStyle[cHotkey], colorStyle[cHotkey], NULL);
 
                 if (havePrev) {
                         mvwaddstr(winInput, 1, 19, "N Next");
                         mvwaddstr(winInput, 1, 28, "P Prev");
-                        mvwchgat(winInput,  1, 19, 1, attribStyle[cHotKey], colorStyle[cHotKey], NULL);
-                        mvwchgat(winInput,  1, 28, 1, attribStyle[cHotKey], colorStyle[cHotKey], NULL);
+
+                        mvwchgat(winInput,  1, 19, 1, attribStyle[cHotkey], colorStyle[cHotkey], NULL);
+                        mvwchgat(winInput,  1, 28, 1, attribStyle[cHotkey], colorStyle[cHotkey], NULL);
                 }
-                key = safeUC(wgetch(winInput));
+
+                key = upCase(wgetch(winInput));
 
                 bool hex = false;
 
@@ -2118,53 +2711,64 @@ void searchFiles(Command cmd)
                 if (! ((key == 'N' || key == 'P') && havePrev)) {
                         positionInWin(cmd, screenWidth, (hex ? " Find Hex Bytes " : " Find Text "));
 
-                        int maxLen = screenWidth - 4;
-                        maxLen -= maxLen % 3;
+                        int maxlen = screenWidth - 4 - 1;
 
-                        char buf[maxLen + 1];
+                        if (hex) {
+                                maxlen -= maxlen % 3;
+                        }
+
+                        char buf[maxlen + 1];
                         int searchLen;
 
                         if (hex) {
-                                getString(buf, maxLen, hexSearchHistory, hexDigits, true, true);
+                                getString(buf, maxlen, hexSearchHistory, hexDigits, true, true);
 
-                                searchLen = packHex(reinterpret_cast<Byte*>(buf));
+                                searchLen = packHex(buf);
                         }
                         else {
-                                getString(buf, maxLen, textSearchHistory);
+                                getString(buf, maxlen, textSearchHistory);
 
                                 searchLen = strlen(buf);
                         }
 
-                        if (! searchLen) return;
+                        if (! searchLen) {
+                                return;
+                        }
+
+                        if (cmd & cmgGotoTop) {
+                                file1.setLast();
+                        }
+
+                        if (cmd & cmgGotoBottom) {
+                                file2.setLast();
+                        }
 
                         lastSearch.assign(buf, searchLen);
 
-                        lowerCase((Byte*)buf, searchLen);
+                        lowCase((Byte*)buf, searchLen);
 
                         lastSearchIgnCase.assign(buf, searchLen);
-
-                        file1.advance = file2.advance = false;
                 }
 
                 if (! singleFile) {
                         file2.updateF();  // kick remnants
                 }
-        } // end no direct N or P
+        }
 
-        const Byte *const searchPattern =
-                reinterpret_cast<const Byte*>((ignoreCase ? lastSearchIgnCase.c_str() : lastSearch.c_str()));
+        Byte* searchPattern = (Byte*) (ignoreCase ? lastSearchIgnCase.data() : lastSearch.data());
 
         if (cmd & cmfFindPrev || key == 'P') {
                 if (cmd & cmgGotoTop) {
                         file1.busy(true);
 
-                        file1.moveToBack(searchPattern, lastSearch.length());
+                        file1.moveBack(searchPattern, lastSearch.size());
                         file1.busy();
                 }
+
                 if (cmd & cmgGotoBottom) {
                         file2.busy(true);
 
-                        file2.moveToBack(searchPattern, lastSearch.length());
+                        file2.moveBack(searchPattern, lastSearch.size());
                         file2.busy();
                 }
         }
@@ -2172,51 +2776,26 @@ void searchFiles(Command cmd)
                 if (cmd & cmgGotoTop) {
                         file1.busy(true);
 
-                        file1.moveTo(searchPattern, lastSearch.length());
+                        file1.moveForw(searchPattern, lastSearch.size());
                         file1.busy();
                 }
+
                 if (cmd & cmgGotoBottom) {
                         file2.busy(true);
 
-                        file2.moveTo(searchPattern, lastSearch.length());
+                        file2.moveForw(searchPattern, lastSearch.size());
                         file2.busy();
                 }
         }
 } // end searchFiles
 
 //--------------------------------------------------------------------
-// Handle a command   ##:hand
+// Handle a command  ##:hand
 
 void handleCmd(Command cmd)
 {
-        stopRead = false;
-
         if (cmd & cmgGoto) {
-                if (cmd & cmgGotoNOff) {
-                        if (cmd & cmgGotoTop) {
-                                file1.move(-file1.repeatOff);
-                        }
-                        if (cmd & cmgGotoBottom) {
-                                file2.move(-file2.repeatOff);
-                        }
-                }
-                else if (cmd & cmgGotoLOff) {
-                        if (cmd & cmgGotoTop) {
-                                file1.move(file1.repeatOff);
-                        }
-                        if (cmd & cmgGotoBottom) {
-                                file2.move(file2.repeatOff);
-                        }
-                }
-                else if (cmd & cmgGotoLast) {
-                        if (cmd & cmgGotoTop) {
-                                file1.getLast();
-                        }
-                        if (cmd & cmgGotoBottom) {
-                                file2.getLast();
-                        }
-                }
-                else if (cmd & cmgGotoForw) {
+                if (cmd & cmgGotoForw) {
                         if (cmd & cmgGotoTop) {
                                 file1.skip();
                         }
@@ -2224,6 +2803,7 @@ void handleCmd(Command cmd)
                                 file2.skip();
                         }
                 }
+
                 else if (cmd & cmgGotoBack) {
                         if (cmd & cmgGotoTop) {
                                 file1.skip(true);
@@ -2232,6 +2812,43 @@ void handleCmd(Command cmd)
                                 file2.skip(true);
                         }
                 }
+
+                else if (cmd & cmgGotoLSet) {
+                        if (cmd & cmgGotoTop) {
+                                file1.setLast();
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                file2.setLast();
+                        }
+                }
+
+                else if ((cmd & cmgGotoMask) == cmgGotoLGet) {
+                        if (cmd & cmgGotoTop) {
+                                file1.getLast();
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                file2.getLast();
+                        }
+                }
+
+                else if ((cmd & cmgGotoMask) == cmgGotoLOff) {
+                        if (cmd & cmgGotoTop) {
+                                file1.move(file1.repeatOff);
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                file2.move(file2.repeatOff);
+                        }
+                }
+
+                else if ((cmd & cmgGotoMask) == cmgGotoNOff) {
+                        if (cmd & cmgGotoTop) {
+                                file1.move(-file1.repeatOff);
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                file2.move(-file2.repeatOff);
+                        }
+                }
+
                 else {
                         gotoPosition(cmd);
                 }
@@ -2245,6 +2862,7 @@ void handleCmd(Command cmd)
                                 file1.seekNotChar();
                                 file1.busy();
                         }
+
                         if (cmd & cmgGotoBottom) {
                                 file2.busy(true);
 
@@ -2252,6 +2870,7 @@ void handleCmd(Command cmd)
                                 file2.busy();
                         }
                 }
+
                 else if (cmd & cmfNotCharUp) {
                         if (cmd & cmgGotoTop) {
                                 file1.busy(true);
@@ -2259,6 +2878,7 @@ void handleCmd(Command cmd)
                                 file1.seekNotChar(true);
                                 file1.busy();
                         }
+
                         if (cmd & cmgGotoBottom) {
                                 file2.busy(true);
 
@@ -2266,13 +2886,14 @@ void handleCmd(Command cmd)
                                 file2.busy();
                         }
                 }
+
                 else {
                         searchFiles(cmd);
                 }
         }
 
         else if (cmd & cmmMove) {
-                int step = steps[cmd & cmmMoveSize];
+                int step = steps[cmd & cmmMoveMask];
 
                 if (! (cmd & cmmMoveForward)) {
                         step *= -1;
@@ -2283,11 +2904,13 @@ void handleCmd(Command cmd)
                                 file1.setLast();
                                 file1.moveToEnd();
                         }
+
                         if (cmd & cmgGotoBottom) {
                                 file2.setLast();
                                 file2.moveToEnd();
                         }
                 }
+
                 else {
                         if (cmd & cmgGotoTop) {
                                 if (step) {
@@ -2298,6 +2921,7 @@ void handleCmd(Command cmd)
                                         file1.moveTo(0);
                                 }
                         }
+
                         if (cmd & cmgGotoBottom) {
                                 if (step) {
                                         file2.move(step);
@@ -2313,6 +2937,7 @@ void handleCmd(Command cmd)
         else if (cmd == cmSyncUp) {
                 file1.sync(&file2);
         }
+
         else if (cmd == cmSyncDn) {
                 file2.sync(&file1);
         }
@@ -2339,11 +2964,13 @@ void handleCmd(Command cmd)
                                 file1.move(0);
                                 file2.move(0);
                         }
+
                         else {
                                 file1.move(size);
                                 file2.move(size);
                         }
                 }
+
                 file1.busy();
                 file2.busy();
         }
@@ -2358,8 +2985,9 @@ void handleCmd(Command cmd)
         }
 
         else if (cmd == cmUseBottom) {
-                if (lockState == lockTop)
+                if (lockState == lockTop) {
                         lockState = lockNeither;
+                }
                 else {
                         lockState = lockTop;
                 }
@@ -2375,6 +3003,7 @@ void handleCmd(Command cmd)
         else if (cmd == cmIgnoreCase) {
                 file1.busy(true, true);
                 file2.busy(true, true);
+
                 ignoreCase ^= true;
                 file1.busy(false, true);
                 file2.busy(false, true);
@@ -2412,35 +3041,118 @@ void handleCmd(Command cmd)
         file2.display();
 
         if (stopRead) {
-                napms(800);  // Esc: avoid quit
+                stopRead = false;
+                napms(500);
                 flushinp();
         }
 } // end handleCmd
 
-//====================================================================
-// Main Program   ##:main
+//--------------------------------------------------------------------
+// Get a command from keyboard  ##:get
 
-int main(int argc, const char* argv[])
+Command getCommand()
 {
-        if ((program_name = strrchr(argv[0], '/')))
-                ++program_name;
-        else
-                program_name = argv[0];
+        Command cmd = cmNothing;
 
-        printf("VBinDiff for Linux %s\n", VBL_VERSION);
+        while (cmd == cmNothing) {
+                int key = file1.readKeyF();
+
+                switch (upCase(key)) {
+                        case KEY_RIGHT:      cmd = cmmMove | cmmMoveByte | cmmMoveForward; break;
+                        case KEY_DOWN:       cmd = cmmMove | cmmMoveLine | cmmMoveForward; break;
+                        case ' ':            cmd = cmmMove | cmmMovePage | cmmMoveForward; break;
+                        case KEY_END:        cmd = cmmMove | cmmMoveAll  | cmmMoveForward; break;
+                        case KEY_LEFT:       cmd = cmmMove | cmmMoveByte;                  break;
+                        case KEY_UP:         cmd = cmmMove | cmmMoveLine;                  break;
+                        case KEY_BACKSPACE:  cmd = cmmMove | cmmMovePage;                  break;
+                        case KEY_HOME:       cmd = cmmMove | cmmMoveAll;                   break;
+
+                        case 'F':        cmd = cmfFind;                break;
+                        case 'N':        cmd = cmfFind | cmfFindNext;  break;
+                        case 'P':        cmd = cmfFind | cmfFindPrev;  break;
+                        case KEY_NPAGE:  cmd = cmfFind | cmfNotCharDn; break;
+                        case KEY_PPAGE:  cmd = cmfFind | cmfNotCharUp; break;
+
+                        case 'G':  cmd = cmgGoto;               break;
+                        case '+':
+                        case '*':
+                        case '=':  cmd = cmgGoto | cmgGotoForw; break;
+                        case '-':  cmd = cmgGoto | cmgGotoBack; break;
+                        case '\'':
+                        case '<':  cmd = cmgGoto | cmgGotoLGet; break;
+                        case 'L':  cmd = cmgGoto | cmgGotoLSet; break;
+                        case '.':  cmd = cmgGoto | cmgGotoLOff; break;
+                        case ',':  cmd = cmgGoto | cmgGotoNOff; break;
+
+                        case 'E':  cmd = lockState == lockTop ? cmEditBottom : cmEditTop; break;
+
+                        case KEY_RETURN:  cmd = singleFile ? cmSmartScroll : cmNextDiff; break;
+
+                        case '#':
+                        case '\\': if (! singleFile) cmd = cmPrevDiff; break;
+
+                        case 'T':  if (! singleFile) cmd = cmUseTop;    break;
+                        case 'B':  if (! singleFile) cmd = cmUseBottom; break;
+
+                        case '1':  if (! singleFile) cmd = cmSyncUp; break;
+                        case '2':  if (! singleFile) cmd = cmSyncDn; break;
+
+                        case 'A':  if (singleFile) cmd = cmShowAscii; break;
+
+                        case 'I':  cmd = cmIgnoreCase; break;
+
+                        case 'R':  cmd = cmShowRaster; break;
+
+                        case 'H':  cmd = cmShowHelp; break;
+
+                        case 'Z':  ee(); break;
+
+                        case KEY_ESCAPE:
+                                if (! singleFile && lockState != lockNeither)
+                                        cmd = lockState == lockTop ? cmUseBottom : cmUseTop;
+                                break;  // better off w/o Esc
+
+                        case KEY_CTRL_C:
+                        case 'Q':  cmd = cmQuit; break;
+                }
+        }
+
+        if (cmd & (cmmMove | cmfFind | cmgGoto)) {
+                if (lockState != lockTop)
+                        cmd |= cmgGotoTop;
+
+                if (lockState != lockBottom && ! singleFile)
+                        cmd |= cmgGotoBottom;
+        }
+
+        return cmd;
+} // end getCommand
+
+//====================================================================
+// Main Program  ##:main
+
+int main(int argc, char* argv[])
+{
+        char* prog = strrchr(*argv, '/');
+
+        prog = prog ? prog + 1 : *argv;
+
+        printf("%s\n\n", helpVersion + 1);
 
         if (argc < 2 || argc > 3) {
-                printf("\n\t%s file1 [file2]\n"
+                printf("\t%s file1 [file2]\n"
                         "\n"
                         "// type 'h' for help\n"
-                        "\n", program_name);
+                        "\n",
+                        prog);
+
                 exit(0);
         }
+
         singleFile = (argc == 2);
 
-        if (! ConWindow::startup()) {
-                fprintf(stderr, "\n %s: Unable to initialize windows\n", program_name);
-                return 1;
+        if (! initialize()) {
+                err(11, "Unable to initialize ncurses");
         }
 
         string err;
@@ -2451,12 +3163,6 @@ int main(int argc, const char* argv[])
         else if (! singleFile && ! file2.setFile(argv[2])) {
                 err = string("Unable to open ") + argv[2] + ": " + strerror(errno);
         }
-        else if (! file1.filesize) {
-                err = string("File is empty: ") + argv[1];
-        }
-        else if (! singleFile && ! file2.filesize) {
-                err = string("File is empty: ") + argv[2];
-        }
         else if (file1.filesize > 281474976710656) {  // 2**40*256 == 0x10**12 == 256TB
                 err = string("File is too big: ") + argv[1];
         }
@@ -2464,19 +3170,18 @@ int main(int argc, const char* argv[])
                 err = string("File is too big: ") + argv[2];
         }
 
-        if (err.size())
-                exitMsg(1, err.c_str());
+        if (err.size()) {
+                exitMsg(12, err.c_str());
+        }
 
-        initialize();
+        setup();
 
         file1.display();
         file2.display();
 
-        Command  cmd;
-        while ((cmd = getCommand()) != cmQuit) {
-                if (! (cmd & cmfFind && ! (cmd & (cmfNotCharDn | cmfNotCharUp)))) {
+        for (Command cmd; (cmd = getCommand()) != cmQuit; handleCmd(cmd)) {
+                if (! (cmd & cmfFind && ! (cmd & (cmfNotCharDn | cmfNotCharUp | cmgGoto)))) {
                         file1.searchOff = file2.searchOff = 0;
-                        file1.advance = file2.advance = false;
                 }
 
                 if (! (cmd == cmNextDiff || cmd == cmPrevDiff)) {
@@ -2486,17 +3191,9 @@ int main(int argc, const char* argv[])
                 if (cmd != cmSmartScroll) {
                         file1.scrollOff = 0;
                 }
-                handleCmd(cmd);
         }
 
-        file1.shutDownF();
-        file2.shutDownF();
-
-        delwin(winInput);
-        delwin(winHelp);
-
-        ConWindow::shutdownW();
+        shutdown();
 
         return 0;
-} // end main
-
+}
