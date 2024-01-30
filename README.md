@@ -103,21 +103,21 @@ Test:
 Screenshoots:
 -------------
 
-![Screenshot](pics/one.jpg)
+![Screenshot](pics/one.jpg)  
 *One File*
 
-![Screenshot](pics/ascii.jpg)
+![Screenshot](pics/ascii.jpg)  
 *ASCII Mode*
 
-![Screenshot](pics/64gb.jpg)
+![Screenshot](pics/64gb.jpg)  
 *Files >64GB*
 
-![Screenshot](pics/two.jpg)
+![Screenshot](pics/two.jpg)  
 *Two Files*
 
-![Screenshot](pics/ask.png)
+![Screenshot](pics/ask.png)  
 *You have to confirm long writes (>512MB)*
 
-![Screenshot](pics/help.png)
+![Screenshot](pics/help.png)  
 *Help Screen*
 
