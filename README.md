@@ -74,7 +74,7 @@ With inserted or deleted bytes, the write can be huge, so it happens always **in
 
 The _last address_ is auto set with initial `Find`, `Goto` w/o relative, `home`/`end` or manual with `l`.
 
-New _TurboSearch_ for SSD: but avoid a leading null byte when searching in massive empty space!
+New _TurboSearch_ for SSD (zero-tolerant)
 
 Only `Esc` interrupt the searches.
 
@@ -121,3 +121,38 @@ Screenshoots:
 ![Screenshot](pics/help.png)  
 *Help Screen*
 
+Fun Facts:
+----------
+
+Hex search worst case:
+```
+00 00{22} 33 00  (4GB, Zeros; SSD)
+```
+
+```
+- vbindiff not-so-QuickSearch:    155s
+```
+ ... "Kolumbus kam als Letzter"
+
+```
+- vbl v1.x                        148s
+```
+
+```
+- vbl v2.x                        115s
+```
+ ... "He reaches his courtyard with toil and with dread,  
+The child in his arms finds he motionless, dead."
+
+```
+- vbl TurboSearch:                 55s
+```
+
+```
+- vbl TurboSearch Zero-Tolerance:   8s
+```
+ ... **vbl** 4 *life*!
+
+-----
+
+I say _thank you_ for the indispensable **git**, which makes coding so much fun, and the amazing - and free - optimizing GNU **C** compiler!
