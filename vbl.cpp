@@ -37,6 +37,7 @@
 //      3.4     edit diff
 //      3.5     set last
 //      3.6     golf search
+//      3.6.1   turbo zero
 //
 //   This program is free software; you can redistribute it and/or
 //   modify it under the terms of the GNU General Public License as
@@ -64,7 +65,7 @@
 
 using namespace std;
 
-#define VBL_VERSION     "3.6"
+#define VBL_VERSION     "3.6.1"
 
 /* set Cursor Color in input window:
    - set it when curs_set(2) has no effect
@@ -91,8 +92,8 @@ f=/tmp/.vbl
 tail -F $f
 vbl file 2>$f; cat $f
 */
-#define mPI(x)          if (debug) fprintf(stderr, "\r%s: %ld 0x%lX \n",  #x, (long)  x,         (long) x);
-#define mPU(x)          if (debug) fprintf(stderr, "\r%s: %ld 0x%lX \n",  #x, (Full)  x,         (Full) x);
+#define mPI(x)          if (debug) fprintf(stderr, "\r%s: 0x%lX %ld \n",  #x, (long)  x,         (long) x);
+#define mPU(x)          if (debug) fprintf(stderr, "\r%s: 0x%lX %ld \n",  #x, (Full)  x,         (Full) x);
 /* profiling: ns */
 #define mPF(x)          if (debug) fprintf(stderr, "\r%s: %.3f 0x%lX \n", #x, (float) x/1000000, (Full) x);
 #define mPS(x)          if (debug) fprintf(stderr, "\r%s: %s \n",         #x,         x);
@@ -1900,10 +1901,20 @@ void FileDisplay::moveTo(FPos newOffset)
 void FileDisplay::moveForw(const Byte* searchFor, Size searchLen)
 {
         FPos newPos = searchOff > 0 ? searchOff + 1 : (searchOff < 0 ? 1 : offset);
-        Full leader = *searchFor;
+        Full leader = 0;
+        Size bias   = 0;
 
-        for (Size i=0; i < 7; ++i) {
-                leader = leader << 8 | *searchFor;
+        while (! *(searchFor + bias) && bias < searchLen) {
+                ++bias;
+        }
+
+        if (bias == searchLen) {
+                bias = 0;
+        }
+        else {
+                for (Size i=0; i < 8; ++i) {
+                        leader = leader << 8 | *(searchFor + bias);
+                }
         }
 
         for (;;) {
@@ -1919,14 +1930,14 @@ void FileDisplay::moveForw(const Byte* searchFor, Size searchLen)
                 }
 
                 for (Size i=0; i <= bytesRead - searchLen; ++i) {
-                        Full turbo = *(Full*) (buffer + i);
+                        Full turbo = *(Full*) (buffer + i + bias);
 
-                        if (! turbo) {  // special case
+                        if (! turbo) {
                                 if (leader) {
                                         goto incr;
                                 }
                                 else {
-                                        goto skip;  // avoid this!
+                                        goto skip;
                                 }
                         }
 
@@ -1989,10 +2000,20 @@ skip:                   if (searchFor[searchLen - 1] == buffer[i + searchLen - 1
 void FileDisplay::moveBack(const Byte* searchFor, Size searchLen)
 {
         FPos newPos = searchOff > 0 ? searchOff : offset;
-        Full leader = *searchFor;
+        Full leader = 0;
+        Size bias   = 0;
 
-        for (Size i=0; i < 7; ++i) {
-                leader = leader << 8 | *searchFor;
+        while (! *(searchFor + bias) && bias < searchLen) {
+                ++bias;
+        }
+
+        if (bias == searchLen) {
+                bias = 0;
+        }
+        else {
+                for (Size i=0; i < 8; ++i) {
+                        leader = leader << 8 | *(searchFor + bias);
+                }
         }
 
         if (newPos + searchLen - 1 > filesize) {
@@ -2010,14 +2031,14 @@ void FileDisplay::moveBack(const Byte* searchFor, Size searchLen)
                 }
 
                 for (Size i = staticSize + (newPos < 0 ? newPos : 0) - searchLen; i >= 0; --i) {
-                        Full turbo = *(Full*) (buffer + i - 7);
+                        Full turbo = *(Full*) (buffer + i + bias - 7);
 
                         if (! turbo) {
                                 if (leader) {
                                         goto decr;
                                 }
                                 else {
-                                        goto skip;  // avoid this!
+                                        goto skip;
                                 }
                         }
 
