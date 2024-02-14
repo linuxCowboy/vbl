@@ -30,12 +30,14 @@ FILE="$MESON_BUILD_ROOT/$PROJECT.p/$PROJECT.cpp.s"
 
 [ -f $FILE ] &&
 
-cat $FILE                  |
-c++filt                    |
-sed '/^\s*\.cfi_/d'        |
-sed '/^\s*\.loc /d'        |
-sed '/^\.L[BEFV]/d'        |
-sed '/\.LVU/d'             |
-sed 's/_[0-9]\+/_d+/g'     |
-sed 's/tmp[0-9]\+/tmpd+/g' > "$MESON_BUILD_ROOT/${PROJECT}_asm.lst"
-
+cat $FILE                         |
+c++filt                           |
+sed '/^\s*\.cfi_/d'               |
+sed '/^\s*\.loc /d'               |
+sed '/^\.L[BEFV]/d'               |
+sed '/\.LVU/d'                    |
+sed 's/_[0-9]\+/_d+/g'            |
+sed 's/tmp[0-9]\+/tmpd+/g'        |
+sed '/GNU/    {p;d};
+     /printf/ {p;d};
+     /#/       s/\.[0-9]\+/.d+/g' > "$MESON_BUILD_ROOT/${PROJECT}_asm.lst"

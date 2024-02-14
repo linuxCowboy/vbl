@@ -38,6 +38,7 @@
 //      3.5     set last
 //      3.6     golf search
 //      3.6.1   turbo zero
+//      3.6.2   SIMD case
 //
 //   This program is free software; you can redistribute it and/or
 //   modify it under the terms of the GNU General Public License as
@@ -65,7 +66,7 @@
 
 using namespace std;
 
-#define VBL_VERSION     "3.6.1"
+#define VBL_VERSION     "3.6.2"
 
 /* set Cursor Color in input window:
    - set it when curs_set(2) has no effect
@@ -99,7 +100,7 @@ vbl file 2>$f; cat $f
 #define mPS(x)          if (debug) fprintf(stderr, "\r%s: %s \n",         #x,         x);
 /* hex dump: pointer, count */
 #define mPX(x, c)       if (debug) fprintf(stderr, "\r%s, %d \n\r",       #x, (int)   c);\
-                                   for (Word i=0; i < c; ++i) fprintf(stderr, "%X ", x[i]);\
+                                   for (Word i=0; i < c; ++i) fprintf(stderr, "%X ", (Byte) x[i]);\
                                    fprintf(stderr, "\n");
 /* w/o redirection */
 #define mPP(x)          if (debug) sleep(x);
@@ -574,9 +575,19 @@ int upCase(int c)
 
 void lowCase(Byte* buf, Size len)
 {
-        for (Size i=0; i < len; ++i) {
-                if (buf[i] <= 'Z' && buf[i] >= 'A') {
-                        buf[i] |= 0x20;
+        Byte* b = bufFile1;  // movdqu ==> movdqa
+
+        if (len == staticSize) {  // SIMD
+                for (Size i=0; i < staticSize; ++i) {
+                        b[i] = b[i] >= 'A' && b[i] <= 'Z' ? b[i] | 0x20 : b[i];
+                }
+        }
+
+        else {
+                for (Size i=0; i < len; ++i) {
+                        if (buf[i] <= 'Z' && buf[i] >= 'A') {
+                                buf[i] |= 0x20;
+                        }
                 }
         }
 }
