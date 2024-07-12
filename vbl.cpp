@@ -39,6 +39,7 @@
 //      3.6     golf search
 //      3.6.1   turbo zero
 //      3.6.2   SIMD case
+//      3.7     start addr
 //
 //   This program is free software; you can redistribute it and/or
 //   modify it under the terms of the GNU General Public License as
@@ -66,7 +67,7 @@
 
 using namespace std;
 
-#define VBL_VERSION     "3.6.2"
+#define VBL_VERSION     "3.7"
 
 /* set Cursor Color in input window:
    - set it when curs_set(2) has no effect
@@ -764,6 +765,7 @@ class FileDisplay
         FPos                    searchOff;
         FPos                    scrollOff;
         FPos                    repeatOff;
+        FPos                    startAddr;
         Size                    filesize;
         Size                    laptime;
         bool                    two;
@@ -979,8 +981,6 @@ void FileDisplay::resizeF()
         delete [] dataF;
 
         dataF = new Byte[bufSize];
-
-        moveTo(offset);
 }
 
 //--------------------------------------------------------------------
@@ -994,6 +994,8 @@ void FileDisplay::initF(int y, const Difference* Diff)
         cwinF.initW(0, y, screenWidth, numLines + 1, cMainWin);
 
         resizeF();
+
+        moveTo(startAddr);
 
         addr = (FPos*) calloc(numLines, sizeof(FPos));
 }
@@ -3030,6 +3032,7 @@ void handleCmd(Command cmd)
 
                 setViewMode();
                 file1.resizeF();
+                file1.move(0);
         }
 
         else if (cmd == cmIgnoreCase) {
@@ -3171,8 +3174,8 @@ int main(int argc, char* argv[])
 
         printf("%s\n\n", helpVersion + 1);
 
-        if (argc < 2 || argc > 3) {
-                printf("\t%s file1 [file2]\n"
+        if (argc == 1) {
+                printf("\t%s file [file2] [addr] [addr2]\n"
                         "\n"
                         "// type 'h' for help\n"
                         "\n",
@@ -3181,7 +3184,34 @@ int main(int argc, char* argv[])
                 exit(0);
         }
 
-        singleFile = (argc == 2);
+        singleFile = true;
+
+        if (argc > 2) {
+                File probe = OpenFile(argv[2]);
+
+                if (probe > 0) {
+                        singleFile = false;
+                        close(probe);
+                }
+                else {
+                        file1.startAddr = strtoull(argv[2], NULL, 0);
+
+                        if (! file1.startAddr) {
+                                singleFile = false;  // error
+                        }
+                }
+
+                if (! singleFile && argv[3]) {
+                        file1.startAddr = strtoull(argv[3], NULL, 0);
+
+                        if (argv[4]) {
+                                file2.startAddr = strtoull(argv[4], NULL, 0);
+                        }
+                        else {
+                                file2.startAddr = file1.startAddr;
+                        }
+                }
+        }
 
         if (! initialize()) {
                 err(11, "Unable to initialize ncurses");
