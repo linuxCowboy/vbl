@@ -121,38 +121,16 @@ Screenshoots:
 ![Screenshot](pics/help.png)  
 *Help Screen*
 
-Fun Facts:
-----------
-
-Hex search worst case:
-```
-00 00{22} 33 00  (4GB, Zeros; SSD)
-```
+Cmdline:
+--------
 
 ```
-- vbindiff not-so-QuickSearch:    155s
-```
- ... "Kolumbus kam als Letzter"
+VBinDiff for Linux 3.7
 
-```
-- vbl v1.x                        148s
-```
+	vbl file [file2] [addr] [addr2]
 
+// type 'h' for help
 ```
-- vbl v2.x                        115s
-```
- ... "He reaches his courtyard with toil and with dread,  
-The child in his arms finds he motionless, dead."
-
-```
-- vbl TurboSearch:                 55s
-```
-
-```
-- vbl TurboSearch Zero-Tolerance:   8s
-```
- ... **vbl** 4 *life*!
 
 -----
 
-I say _thank you_ for the indispensable **git**, which makes coding so much fun, and the amazing - and free - optimizing GNU **C** compiler!
