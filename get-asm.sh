@@ -6,14 +6,23 @@
 # +
 #
 # cleaning assembler source
+#
+#       optional tag
 
-[ $MESON_BUILD_ROOT ] && PROJECT=`basename $MESON_BUILD_ROOT`
+if [ "$MESON_BUILD_ROOT" ]; then
+        FILE="$MESON_BUILD_ROOT/$1"
 
-FILE="$PROJECT/$PROJECT"
+elif [ "${1#${1%.s}}" = ".s" ]; then
+        FILS="$1"
 
-[ $1 ] && FILE=$1
+elif [ "${1#${1%.S}}" = ".S" ]; then
+        FILS="$1"
 
-[ -f $FILE ] &&
+elif [ "$1" ]; then
+        FILE="$1"
+fi
+
+[ -f "$FILE" ] &&
 
 objdump --source-comment \
         --disassembler-options intel \
@@ -22,22 +31,75 @@ objdump --source-comment \
         --disassembler-color=on \
         --no-show-raw-insn \
         --visualize-jumps=color \
-                $FILE
+                "$FILE"
 
-#####
+#################################
 
-FILE="$MESON_BUILD_ROOT/$PROJECT.p/$PROJECT.cpp.s"
+Xclusiv()  # cut Label: block
+{
+        perl -ne '
+                BEGIN {
+                        $r = "'$1'"
+                }
 
-[ -f $FILE ] &&
+                if (/^$r/) {
+                        while (<>) {
+                                if (/^\S/) {
+                                        last if not (/^$r/)
+                                }
+                        }
+                }
 
-cat $FILE                         |
-c++filt                           |
-sed '/^\s*\.cfi_/d'               |
-sed '/^\s*\.loc /d'               |
-sed '/^\.L[BEFV]/d'               |
-sed '/\.LVU/d'                    |
-sed 's/_[0-9]\+/_d+/g'            |
-sed 's/tmp[0-9]\+/tmpd+/g'        |
-sed '/GNU/    {p;d};
-     /printf/ {p;d};
-     /#/       s/\.[0-9]\+/.d+/g' > "$MESON_BUILD_ROOT/${PROJECT}_asm.lst"
+                print
+        '
+}
+
+ASM_DIR="/tmp/VBL"
+
+[ "$2" ] && TAG="-$2"
+
+if [ "$MESON_BUILD_ROOT" ]; then
+        FILA="$MESON_BUILD_ROOT/$1.p/$1.cpp.s"
+        LIST="$MESON_BUILD_ROOT/${1}_asm.lst"
+        DIFF="$MESON_BUILD_ROOT/${1}_asm-diff.lst"
+
+elif [ -f "$FILS" ]; then
+        [ -d "$ASM_DIR" ] || mkdir -pv "$ASM_DIR" || exit
+
+        FILA="$FILS"
+        FILS=`basename "${FILS%.s}" .S`
+        LIST="$ASM_DIR/$FILS-asm$TAG.lst"
+        DIFF="$ASM_DIR/$FILS-asm$TAG-diff.lst"
+fi
+
+[ -f "$FILA" ] &&
+
+cat "$FILA"                             |
+c++filt                                 |
+
+sed '/^\s*\.cfi_/d'                     |
+sed '/^\s*\.loc /d'                     |
+sed '/^\.L[BEFV]/d'                     |
+sed '/\.LVU/d'                          |
+sed '/\.LVL/d'                          |
+sed 's/_[0-9]\+/_d+/g'                  |
+sed 's/tmp[0-9]\+/tmpD+/g'              |
+sed '/#.*\.[0-9]/ s/\.[0-9]\+/.D+/g'    |
+
+Xclusiv ".Ldebug"                       |
+Xclusiv ".LLST"                         |
+Xclusiv ".LLRL"                         |
+
+        cat > "$LIST"  # test/debug expressions
+#        exit
+
+# kick line numbers + labels for "dwdiff old new"
+[ -f "$LIST" ] &&
+
+perl -pe '
+        s%( \.\./[\w.-]*?cpp):\d+:%$1:d+:%;
+
+        s/\.L\d+/.Ld+/g;
+
+' "$LIST" > "$DIFF"
+

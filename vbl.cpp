@@ -2,9 +2,9 @@
 //
 //   VBinDiff for Linux
 //
-//   Hex viewer, differ and editor
+//   Hex viewer, differ, dumper and editor
 //
-//   Copyright 2021-2024 by linuxCowboy
+//   Copyright 2021-2025 by linuxCowboy
 //
 //   vbindiff       by Christopher J. Madsen
 //   64GB           by Bradley Grainger
@@ -12,6 +12,7 @@
 //
 //   Version:
 //      1.x     classic vbindiff interface, fix 32 byte
+//      -----------------------------------------------
 //      2.0     dynamic 16/24/32 byte width
 //      2.1     256 terabyte files
 //      2.2     kick panels
@@ -40,6 +41,12 @@
 //      3.6.1   turbo zero
 //      3.6.2   SIMD case
 //      3.7     start addr
+//      ------------------
+//      4.0     SSE2 SIMD
+//      4.1     search all
+//      4.2     jump addr
+//      4.3     dump mode
+//      4.4     diff mode
 //
 //   This program is free software; you can redistribute it and/or
 //   modify it under the terms of the GNU General Public License as
@@ -59,57 +66,74 @@
 #include <fcntl.h>
 #include <time.h>
 #include <err.h>
+#include <x86gprintrin.h>
+#include <emmintrin.h>
+#include <ncurses.h>
 
 #include <string>
 #include <deque>
 
-#include <ncurses.h>
-
 using namespace std;
 
-#define VBL_VERSION     "3.7"
+#define VBL_VERSION     "4.4"
 
-/* set Cursor Color in input window:
-   - set it when curs_set(2) has no effect
+// ###################
+// ##### options #####
+// ###################
 
-   - uses OSC (Operating System Command)
-
-   - cmdline override:
-        meson setup [--wipe] -Dcpp_args=-DSET_CURSOR_COLOR=0|1 vbl
-        meson configure      -Dcpp_args=-DSET_CURSOR_COLOR=0|1 vbl
-
-        meson compile -C vbl */
+/* set Cursor Color in input window with Operating System Command */
 #ifndef SET_CURSOR_COLOR
 #define SET_CURSOR_COLOR        0
 #endif
 
-/* show a summary in edit insert/delete after large writes */
+/* show a summary in edit insert/delete after large writes + wait */
 #ifndef SHOW_WRITE_SUMMARY
 #define SHOW_WRITE_SUMMARY      0
 #endif
 
-bool debug = 1;
+/* thousands separator (or '\0') */
+#define THOU_SEP                '.'
+
+// ###################
+
+/* const: gcc optimizes macros away */
+const bool debug = 0;  //  ##:q
+
 /* curses debug:
 f=/tmp/.vbl
 tail -F $f
 vbl file 2>$f; cat $f
 */
-#define mPI(x)          if (debug) fprintf(stderr, "\r%s: 0x%lX %ld \n",  #x, (long)  x,         (long) x);
-#define mPU(x)          if (debug) fprintf(stderr, "\r%s: 0x%lX %ld \n",  #x, (Full)  x,         (Full) x);
-/* profiling: ns */
-#define mPF(x)          if (debug) fprintf(stderr, "\r%s: %.3f 0x%lX \n", #x, (float) x/1000000, (Full) x);
-#define mPS(x)          if (debug) fprintf(stderr, "\r%s: %s \n",         #x,         x);
-/* hex dump: pointer, count */
-#define mPX(x, c)       if (debug) fprintf(stderr, "\r%s, %d \n\r",       #x, (int)   c);\
-                                   for (Word i=0; i < c; ++i) fprintf(stderr, "%X ", (Byte) x[i]);\
-                                   fprintf(stderr, "\n");
+#define mPI(x)          if (debug)  fprintf(stderr, "\r%s: 0x%lX %ld\n",  #x, (long)  x, (long)  x);
+#define mPU(x)          if (debug)  fprintf(stderr, "\r%s: 0x%lX %lu\n",  #x, (Full)  x, (Full)  x);
+#define mPF(x)          if (debug)  fprintf(stderr, "\r%s: %f\n",         #x, (float) x);
+#define mPS(x)          if (debug)  fprintf(stderr, "\r%s: %s\n",         #x,         x);
+
+#define mPsec(x)        if (debug)  fprintf(stderr, "\r%s: %ld sec\n",    #x, (long)  x);
+#define mPms(x)         if (debug)  fprintf(stderr, "\r%s: %.3f msec\n",  #x, (float) x / 1000000);
+
+/* profiling: sec, msec; init: {1,} */
+#define mTs(x,init...)  if (debug) {if (1 != 1##init) {x = time(NULL);}\
+                                    else              {x = time(NULL) - x; mPsec(x)}}
+#define mTms(x,init...) if (debug) {if (1 != 1##init) {x = timer();}\
+                                    else              {x = timer(2,x); mPms(x)}}  // one-shot
+
+#define mZ(x)           if (debug)                    {x = 0;}                          // reset
+#define mTpp(x,init...) if (debug) {if (1 != 1##init) timer(1); else {x += timer(2);}}  // sum-up (t0)
+
 /* w/o redirection */
-#define mPP(x)          if (debug) sleep(x);
-#define mPK             if (debug) file1.readKeyF();
+#define mPP(x)          if (debug)  sleep(x);
+#define mPK             if (debug)  file1.readKeyF();
+
+/* hex dump: pointer, count */
+#define mPX(x, c)       if (debug) {fprintf(stderr, "\r%s, %d \n\r", #x, (int) c);\
+                                    for (Word I=0; I < c; ++I) fprintf(stderr, "%X ", (Byte) (x)[I]);\
+                                    fprintf(stderr, "\n");}
+
+#define mCeil(x, y)     x / y + (x % y ? 1 : 0)
 
 #define mEdit           historyPos = history.size();
-#define mScale          count   / (scale ? scale : 1)
-#define mScaleInc       count++ / (scale ? scale : 1)
+#define mScale          count / (scale ? scale : 1)
 
 #define KEY_CTRL_C      0x03
 #define KEY_TAB         0x09
@@ -132,6 +156,7 @@ enum ColorPair {
         pairGreenBlack,
         pairWhiteCyan,
         pairWhiteRed,
+        pairWhiteGreen,
         pairBlackYellow
 };
 
@@ -144,11 +169,14 @@ enum Style {
         cEdit,
         cInsert,
         cSearch,
+        cSeek,
+        cMatch,
         cRaster,
         cAddress,
         cHotkey,
         cHighFile,
         cHighBusy,
+        cHighBus2,
         cHighEdit
 };
 
@@ -160,29 +188,35 @@ static const ColorPair colorStyle[] = {
         pairGreenBlack,  // cDiff
         pairYellowBlue,  // cEdit
         pairGreenBlue,   // cInsert
-        pairRedWhite,    // cSearch
+        pairWhiteRed,    // cSearch
+        pairWhiteGreen,  // cSeek
+        pairRedWhite,    // cMatch
         pairBlackCyan,   // cRaster
         pairYellowBlue,  // cAddress
         pairGreenBlue,   // cHotkey
         pairWhiteCyan,   // cHighFile
         pairWhiteRed,    // cHighBusy
+        pairWhiteGreen,  // cHighBus2
         pairBlackYellow  // cHighEdit
 };
 
 static const attr_t attribStyle[] = {
                     COLOR_PAIR(colorStyle[ cMainWin  ]),
-        A_BOLD    | COLOR_PAIR(colorStyle[ cInputWin ]),
-        A_BOLD    | COLOR_PAIR(colorStyle[ cHelpWin  ]),
+                    COLOR_PAIR(colorStyle[ cInputWin ]),
+                    COLOR_PAIR(colorStyle[ cHelpWin  ]),
                     COLOR_PAIR(colorStyle[ cName     ]),
         A_BOLD    | COLOR_PAIR(colorStyle[ cDiff     ]),
         A_BOLD    | COLOR_PAIR(colorStyle[ cEdit     ]),
         A_BOLD    | COLOR_PAIR(colorStyle[ cInsert   ]),
-                    COLOR_PAIR(colorStyle[ cSearch   ]),
+        A_BOLD    | COLOR_PAIR(colorStyle[ cSearch   ]),
+        A_BOLD    | COLOR_PAIR(colorStyle[ cSeek     ]),
+                    COLOR_PAIR(colorStyle[ cMatch    ]),
                     COLOR_PAIR(colorStyle[ cRaster   ]),
         A_BOLD    | COLOR_PAIR(colorStyle[ cAddress  ]),
         A_BOLD    | COLOR_PAIR(colorStyle[ cHotkey   ]),
         A_BOLD    | COLOR_PAIR(colorStyle[ cHighFile ]),
         A_BOLD    | COLOR_PAIR(colorStyle[ cHighBusy ]),
+        A_BOLD    | COLOR_PAIR(colorStyle[ cHighBus2 ]),
                     COLOR_PAIR(colorStyle[ cHighEdit ])
 };
 
@@ -193,6 +227,7 @@ typedef unsigned char   Byte;
 typedef unsigned short  Word;
 typedef unsigned int    Half;
 typedef unsigned long   Full;
+typedef __m128i         Quad;
 typedef Byte            Command;
 
 typedef int             File;
@@ -212,11 +247,13 @@ const Command   cmgGotoTop     = 0x08;  // Flag
 const Command   cmgGotoBottom  = 0x04;  // Flag
 const Command   cmgGotoForw    = 0x40;
 const Command   cmgGotoBack    = 0x20;
-const Command   cmgGotoLSet    = 0x10;
+const Command   cmgGotoMask    = 0x13;  // Mask
 const Command   cmgGotoLGet    = 0x01;
-const Command   cmgGotoLOff    = 0x02;
-const Command   cmgGotoNOff    = 0x03;
-const Command   cmgGotoMask    = 0x03;
+const Command   cmgGotoLSet    = 0x02;
+const Command   cmgGotoLOff    = 0x03;
+const Command   cmgGotoNOff    = 0x11;
+const Command   cmgGotoJGet    = 0x12;
+const Command   cmgGotoJSet    = 0x13;
 
 const Command   cmfFind        = 0x40;  // Main cmd
 const Command   cmfFindNext    = 0x20;
@@ -226,11 +263,11 @@ const Command   cmfNotCharUp   = 0x01;
 
 const Command   cmmMove        = 0x20;  // Main cmd
 const Command   cmmMoveForward = 0x10;
+const Command   cmmMoveMask    = 0x03;  // Mask
 const Command   cmmMoveByte    = 0x00;  // Move 1 byte
 const Command   cmmMoveLine    = 0x01;  // Move 1 line
 const Command   cmmMovePage    = 0x02;  // Move 1 page
 const Command   cmmMoveAll     = 0x03;  // Move to begin or end
-const Command   cmmMoveMask    = 0x03;
 
 const Command   cmNothing      =  0;
 const Command   cmUseTop       =  1;
@@ -256,24 +293,27 @@ const Size minScreenHeight = 24,  // Enforced minimum height
            skipForw = 4,  // Percent to skip forward
            skipBack = 1,  // Percent to skip backward
 
-           staticSize = 1 << 24,  // size global buffers
-           warnResize = 1 << 29,  // confirmation threshold
+           staticSize = 1L << 25,  // size global buffers
+           warnResize = 1L << 29,  // confirmation threshold
 
-           maxHistory = 20;
+           barDelay = 6,  // msec, smoothness vs. speed
 
-const char *hexDigits     = "0123456789ABCDEF",                     // search
-           *hexDigitsGoto = "0123456789ABCDEFabcdef%Xx+-kmgtKMGT",  // goto
+           maxHistory = 20,  // find and goto
 
-           thouSep = ',',  // thousands separator (or '\0')
+           dumpDef = 16,  // terminal dump: both
+           dumpMax = 32;  // full dump only
+
+const char *hexDigits     = "0123456789ABCDEF",                       // search
+           *hexDigitsGoto = "0123456789ABCDEFabcdef%Xx+-kmgtKMGTsS",  // goto
 
            *colorInsert = "#00BBBB",  // cursor color "normal"
            *colorDelete = "#EE0000";  // cursor color "very visible"
 
 const wchar_t barSyms[] = {L'▏', L'▎', L'▍', L'▌', L'▋', L'▊', L'▉', L'█'};
 
-const char sPrefix[] = "kmgtKMGT";
-const Size aPrefix[] = { 1000, 1000000, 1000000000, 1000000000000,
-                         1024, 1048576, 1073741824, 1099511627776 };
+const char sPrefix[] = "skmgtSKMGT";
+const Size aPrefix[] = {  512, 1024, 1048576, 1073741824, 1099511627776,
+                         4096, 1000, 1000000, 1000000000, 1000000000000 };
 
 //--------------------------------------------------------------------
 // Help screen text - max 21 lines (minScreenHeight - 3)  ##:x
@@ -284,8 +324,8 @@ const char *aHelp[] = {
 "  ",
 "  Find   Next Prev       PgDn PgUp == next/prev diff byte",
 "  ",
-"  Goto [+-]{dec hex 0x x$}[%|kmgtKMGT]   +4% + * =  -1% -",
-"   last addr: get ' <  set l  last offset .  neg offset ,",
+"  Goto [+-]{dec hex 0x x$}[%|sSkmgtKMGT] +4% + * =  -1% -",
+"  Last addr: ' <   Jump Addr: \"   last off: .  neg off: ,",
 "  ",
 "  Edit file   show Raster   Ignore case              Quit",
 "  ",
@@ -307,7 +347,7 @@ const int longestLine = 57;  // adjust!
 const Byte aBold[] = {  // hotkeys, start y:1, x:1
         4,3,  4,10, 4,15,
         6,3,  6,46, 6,48, 6,50,  6,57,
-        7,19, 7,21,  7,28,  7,43,  7,57,
+        7,3, 7,14, 7,16,  7,20, 7,31,  7,45, 7,57,
         9,3,  9,20,  9,29,  9,54,
         12,26,
         15,23, 15,25,  15,41, 15,43,
@@ -326,11 +366,13 @@ const int helpWidth  = 1 + longestLine + 2                  + 1,
 WINDOW *winInput,
        *winHelp;
 
-alignas(0x100000)
+alignas(0x1000)
 Byte bufFile1[staticSize],
      bufFile2[staticSize];
 
 Byte *buffer = bufFile1;
+
+FPos *sm4rt;
 
 char bufTimer[64];
 
@@ -339,9 +381,9 @@ bool singleFile,
      sizeTera,
      modeAscii,
      ignoreCase,
-     stopRead;
-
-int haveDiff;
+     stopRead,
+     useSSE2,
+     haveDiff;
 
 LockState lockState;
 
@@ -356,20 +398,65 @@ BytDeq editBytes,
        editColor;
 
 // Set dynamically for 16/24/32 byte width
-int screenWidth,   // Number of columns in curses
-    linesTotal,    // Number of lines in curses
-    numLines,      // Number of lines of each file to display
-    bufSize,       // Number of bytes of each file to display
-    lineWidth,     // Number of bytes displayed per line
-    lineWidthAsc,  // Number of bytes displayed per line ascii
-    inWidth,       // Number of digits in input window
-    leftMar,       // Starting column of hex display
-    leftMar2,      // Starting column of ASCII display
-    searchIndent,  // Lines of search result indentation
-    steps[4];      // Number of bytes to move for each step
+Size screenWidth,   // Number of columns in curses
+     linesTotal,    // Number of lines in curses
+     numLines,      // Number of lines of each file to display
+     bufSize,       // Number of bytes of each file to display
+     lineWidth,     // Number of bytes displayed per line
+     lineWidthAsc,  // Number of bytes displayed per line ascii
+     inWidth,       // Number of digits in input window
+     leftMar,       // Starting column of hex display
+     leftMar2,      // Starting column of ASCII display
+     searchIndent,  // Lines of search result indentation
+     steps[4],      // Number of bytes to move for each step
+
+     diffMode,      // diff files to terminal
+     dumpMode,      // dump file to terminal
+     dumpBeg,
+     dumpEnd,
+     dumpLen,
+     dumpWid;
+
+// debug timer 1-9, init 0
+__attribute__ ((unused)) static Size t1, t2, t3, t4, t5, t6, t7, t8, t9, t0;
+
+char *program,
+
+#if THOU_SEP_COMMA
+     thouSep = ',';
+#else
+     thouSep = THOU_SEP;
+#endif
 
 //====================================================================
 // Global Functions
+
+//--------------------------------------------------------------------
+// Global timer / profiling
+// modes: 0-set 1-sum_up 2-nsec 3-msec
+
+Size timer(int mode=0, Size var=t0)
+{
+        timespec ts;
+
+        clock_gettime(CLOCK_TAI, &ts);
+
+        Size ret = ts.tv_sec * 1000000000 + ts.tv_nsec;
+
+        if (mode == 1) {
+                t0 = ret;
+        }
+
+        else if (mode == 2) {
+                ret -= var;
+        }
+
+        else if (mode == 3) {
+                ret = (ret - var) / 1000000;
+        }
+
+        return ret;
+}
 
 //--------------------------------------------------------------------
 // FileIO
@@ -410,6 +497,12 @@ Size ReadFile(File file, Byte* buf, Size cnt)
         }
         timeout(-1);
 
+        /* mitigate read errors */
+        if (ret < 0) {
+                ret      = 0;
+                stopRead = true;
+        }
+
         return ret;
 }
 
@@ -417,6 +510,169 @@ FPos SeekFile(File file, FPos position, int whence=SEEK_SET)
 {
         return lseek(file, position, whence);
 }
+
+//--------------------------------------------------------------------
+// Dumper (no curses)
+
+void dumpFile(char* file)
+{
+        File fd;
+
+        if ((fd = OpenFile(file)) < 0) {
+                err(2, file);
+        }
+
+        if (! dumpLen) {
+                if (! dumpEnd) {
+                        dumpEnd = SeekFile(fd, 0, SEEK_END);
+                }
+
+                dumpLen = dumpEnd - dumpBeg;
+        }
+
+        if (SeekFile(fd, dumpBeg) < 0) {
+                err(3, "seek");
+        }
+
+        Size bytesRead, cnt, len;
+
+        if (dumpMode == 2) {  // binary
+                Byte* pb = buffer;
+
+                for (; ; dumpLen -= cnt) {
+                        if ((bytesRead = read(fd, pb, staticSize)) < 0) {
+                                err(4, "read");
+                        }
+
+                        if (! (cnt = min(bytesRead, dumpLen))) {
+                                break;
+                        }
+
+                        for (Size i=0; i < cnt; ++i) {
+                                putchar(pb[i]);
+                        }
+                }
+        }
+
+        else {
+                Size tera = dumpBeg + dumpLen >= 68719476736 ? 3 : 0;
+
+                if (dumpWid > dumpMax) {
+                       dumpWid = dumpMax;
+                }
+
+                char addr[9];
+                sprintf(addr, "%%0%dlX ", tera ? 12 : 9);
+
+                Size lcnt = 9 + tera + 2 + (dumpWid - 1) / 8 + dumpWid * 3 + 1 + dumpWid;
+                char line[lcnt + 1] = { 0 };
+
+                for (; ; dumpLen -= cnt, dumpBeg += cnt) {
+                        if ((bytesRead = read(fd, buffer, staticSize)) < 0) {
+                                err(4, "read");
+                        }
+
+                        if ((cnt = min(bytesRead, dumpLen)) <= 0) {
+                                printf(addr, dumpBeg);
+
+                                putchar(10);
+                                break;
+                        }
+
+                        for (Size i=0; i < cnt; i += len) {
+                                if (i > cnt - dumpWid) {
+                                        memset(line, ' ', lcnt);
+                                }
+
+                                char *pbufHex = line;
+
+                                pbufHex += sprintf(line, addr, dumpBeg + i);
+
+                                len = min(cnt - i, dumpWid);
+
+                                for (Size j=0; j < len; ++j) {
+                                        if (! (j % 8)) {
+                                                *pbufHex++ = ' ';
+                                        }
+
+                                        Byte b = buffer[i + j];
+
+                                        pbufHex += sprintf(pbufHex, "%02X ", b);
+
+                                        line[lcnt - dumpWid + j] = b > '~' || b < ' ' ? '.' : b;
+                                }
+
+                                *pbufHex = ' ';
+
+                                puts(line);
+                        }
+                }
+        }
+
+        close(fd);
+
+        exit(0);
+} // end dumpFile
+
+//--------------------------------------------------------------------
+// Cmdline differ
+
+FPos diffFile(char* file1, char* file2)
+{
+        File fd1, fd2;
+
+        if ((fd1 = OpenFile(file1)) < 0) {
+                err(2, file1);
+        }
+
+        if ((fd2 = OpenFile(file2)) < 0) {
+                close(fd1);
+                err(2, file2);
+        }
+
+        FPos off = 0;
+        Size size, size1, size2;
+
+        do {
+                if ((size1 = read(fd1, bufFile1, staticSize)) < 0) {
+                        err(4, file1);
+                }
+
+                if ((size2 = read(fd2, bufFile2, staticSize)) < 0) {
+                        err(4, file2);
+                }
+
+                if (size1 == 0 && size2 == 0) {
+                        off = -1;
+                        break;
+                }
+
+                size = min(size1, size2);
+
+                if (size == 0) {
+                        break;
+                }
+
+                if (memcmp(bufFile1, bufFile2, size)) {
+                        break;
+                }
+
+                if (size < staticSize) {
+                        if (size1 == size2) {
+                                off = -1;
+                        }
+                        break;
+                }
+
+                off += staticSize;
+
+        } while (1);
+
+        close(fd1);
+        close(fd2);
+
+        return off;
+} // end diffFile
 
 //--------------------------------------------------------------------
 // Initialize ncurses  ##:i
@@ -448,6 +704,7 @@ bool initialize()
                 init_pair(pairGreenBlack,  COLOR_GREEN,  COLOR_BLACK);
                 init_pair(pairWhiteCyan,   COLOR_WHITE,  COLOR_CYAN);
                 init_pair(pairWhiteRed,    COLOR_WHITE,  COLOR_RED);
+                init_pair(pairWhiteGreen,  COLOR_WHITE,  COLOR_GREEN);
                 init_pair(pairBlackYellow, COLOR_BLACK,  COLOR_YELLOW);
         }
 
@@ -480,6 +737,8 @@ void hideCursor()
 
 void shutdown()
 {
+        free(sm4rt);
+
         delwin(winInput);
         delwin(winHelp);
 
@@ -594,6 +853,95 @@ void lowCase(Byte* buf, Size len)
 }
 
 //--------------------------------------------------------------------
+// Convert buffer for ascii
+
+void setAscii(Size len)
+{
+        Byte* b = bufFile1;  // enregister
+
+        if (len == staticSize) {  // SIMD
+                for (Size i=0; i < staticSize; ++i) {
+                        b[i] = b[i] > '~' || b[i] < ' ' ? ' ' : b[i];
+                }
+        }
+
+        else {
+                for (Size i=0; i < len; ++i) {
+                        if (b[i] > '~' || b[i] < ' ') {
+                                b[i] = ' ';
+                        }
+                }
+        }
+}
+
+//--------------------------------------------------------------------
+// Compare lines for smartScroll:  16 / 32 / 64 / 96 / 128 Byte
+
+bool cmpLine(Byte* ln1, Byte* ln2, Full cnt)
+{
+        Quad q1 = _mm_load_si128((Quad*) ln1),
+             q2 = _mm_load_si128((Quad*) ln2);
+
+        q1 = _mm_cmpeq_epi8(q1, q2);
+
+        if (_mm_movemask_epi8(q1) != 0xFFFF) {
+                return true;
+        }
+
+        if (cnt == 16) {
+                return false;
+        }
+
+        q1 = _mm_load_si128((Quad*) (ln1 + 16));
+        q2 = _mm_load_si128((Quad*) (ln2 + 16));
+
+        q1 = _mm_cmpeq_epi8(q1, q2);
+
+        if (_mm_movemask_epi8(q1) != 0xFFFF) {
+                return true;
+        }
+
+        for (Full i = 32; i < cnt; i += 16) {
+                q1 = _mm_load_si128((Quad*) (ln1 + i));
+                q2 = _mm_load_si128((Quad*) (ln2 + i));
+
+                q1 = _mm_cmpeq_epi8(q1, q2);
+
+                if (_mm_movemask_epi8(q1) != 0xFFFF) {
+                        return true;
+                }
+        }
+
+        return false;
+} // end cmpLine
+
+//--------------------------------------------------------------------
+// Compare lines for smartScroll (unaligned):  24 Byte
+
+bool cmpLineU(Byte* ln1, Byte* ln2, Full cnt)
+{
+        Quad q1 = _mm_loadu_si128((Quad*) ln1),
+             q2 = _mm_loadu_si128((Quad*) ln2);
+
+        q1 = _mm_cmpeq_epi8(q1, q2);
+
+        if (_mm_movemask_epi8(q1) != 0xFFFF) {
+                return true;
+        }
+
+        q1 = _mm_loadu_si128((Quad*) (ln1 + 8));
+        q2 = _mm_loadu_si128((Quad*) (ln2 + 8));
+
+        q1 = _mm_cmpeq_epi8(q1, q2);
+
+        if (_mm_movemask_epi8(q1) != 0xFFFF) {
+                return true;
+        }
+
+        return false;
+}
+
+//--------------------------------------------------------------------
 // Convert hex string to bytes
 
 int packHex(char* buf)
@@ -694,18 +1042,18 @@ class ConWindow
         WINDOW         *winW;
 
     public:
-        ConWindow()                                             {}
-       ~ConWindow()                                             { delwin(winW); winW = NULL; }
+        ConWindow()                                                     {}
+       ~ConWindow()                                                     { delwin(winW); winW = NULL; }
 
         void            initW(short x, short y, short width, short height, Style style);
-        void            updateW()                               { touchwin(winW); wrefresh(winW); }
-        int             readKeyW()                              { return wgetch(winW); }
+        void            updateW()                                       { touchwin(winW); wrefresh(winW); }
+        int             readKeyW()                                      { return wgetch(winW); }
 
-        void            put(short x, short y, const char* s)    { mvwaddstr(winW, y, x, s); }
-        void            setAttribs(Style color)                 { wattrset(winW, attribStyle[color]); }
-        void            putAttribs(short x, short y, Style color, short count);
+        void            put(short x, short y, const char* s)            { mvwaddstr(winW, y, x, s); }
+        void            putAttribs(short x, short y, Style color, short count) {
+                                mvwchgat(winW, y, x, count, attribStyle[color], colorStyle[color], NULL); }
 
-        void            setCursor(short x, short y)             { wmove(winW, y, x); }
+        void            setCursor(short x, short y)                     { wmove(winW, y, x); }
 
 }; // end ConWindow
 
@@ -726,14 +1074,6 @@ void ConWindow::initW(short x, short y, short width, short height, Style attrib)
         keypad(winW, TRUE);
 }
 
-//--------------------------------------------------------------------
-// Change the attributes of characters in the window
-
-void ConWindow::putAttribs(short x, short y, Style color, short count)
-{
-        mvwchgat(winW, y, x, count, attribStyle[color], colorStyle[color], NULL);
-}
-
 //====================================================================
 // Class FileDisplay  ##:file
 
@@ -747,19 +1087,20 @@ class FileDisplay
 
         const Difference       *diffsF;
 
-        char                   *fileName;
         File                    fd;
         bool                    editable;
 
         Byte                   *dataF;
+        Byte                   *sAllF;
         int                     dataSize;
         FPos                    offset;
         FPos                    prevOffset;
         FPos                    diffOffset;
         FPos                    lastOffset;
 
-        FPos                   *addr;
+        int                     seekup;
         int                     se4rch;
+        bool                    se4rchAll;
 
     public:
         FPos                    searchOff;
@@ -767,12 +1108,12 @@ class FileDisplay
         FPos                    repeatOff;
         FPos                    startAddr;
         Size                    filesize;
-        Size                    laptime;
+        char                   *filename;
         bool                    two;
 
     public:
                 FileDisplay()                           {}
-               ~FileDisplay();
+               ~FileDisplay()                           { if (fd) close(fd); delete [] dataF; delete [] sAllF; }
 
         bool    setFile(char* FileName);
         void    initF(int y, const Difference* Diff);
@@ -781,8 +1122,9 @@ class FileDisplay
         int     readKeyF()                              { return cwinF.readKeyW(); }
 
         void    display();
-        void    busy(bool on, bool ic);
-        void    highEdit(short count);
+        void    attr(short x, short y, Style color, short count) { cwinF.putAttribs(x, y, color, count); }
+        void    busy(bool on, bool ic, bool np);
+        void    highEdit(short count)                   { attr(0, 0, cHighEdit, count); }
 
         void    edit(const FileDisplay* other);
         void    editOut(short outOffset);
@@ -790,20 +1132,24 @@ class FileDisplay
         bool    assure();
         void    progress1();
         void    progress(wchar_t* bar, int count, int delay, int stint);
-        Size    finish(int init);
 
         void    setLast()                               { lastOffset = offset; }
-        void    getLast()                               { FPos tmp = offset; moveTo(lastOffset); lastOffset = tmp; }
+        void    setJump()                               { startAddr  = offset; }
+        void    getLast()                               { FPos tmp   = offset; moveTo(lastOffset); lastOffset = tmp; }
         void    skip(bool upwards);
         void    sync(const FileDisplay* other);
+        void    mark(Byte* searchFor, Size searchLen);
 
         void    move(FPos step)                         { moveTo(offset + step); }
         void    moveTo(FPos newOffset);
         void    moveToEnd()                             { moveTo(filesize - steps[cmmMovePage]); }
-        void    moveForw(const Byte* searchFor, Size searchLen);
-        void    moveBack(const Byte* searchFor, Size searchLen);
 
-        void    seekNotChar(bool upwards);
+        void    moveForw(Byte* searchFor, Size searchLen);  // __attribute__ ((__target__ ("sse2")))
+        void    moveBack(Byte* searchFor, Size searchLen);
+
+        void    seekForw();
+        void    seekBack();
+
         void    smartScroll();
 }; // end FileDisplay
 
@@ -821,11 +1167,11 @@ class Difference
 
     public:
                 Difference(FileDisplay* File1, FileDisplay* File2):
-                                        file1D(File1), file2D(File2)  {}
+                                file1D(File1), file2D(File2)            {}
                ~Difference()                                            { delete [] dataD; }
-        void    resizeD();
-        int     compute(Command cmd);
-        void    speedup(int way);
+        void    resizeD()                                               { dataD = new Byte[bufSize]; }
+        void    compute();
+        void    differ(int cmd);
 }; // end Difference
 
 //====================================================================
@@ -837,129 +1183,211 @@ Difference      diffs(&file1, &file2);
 
 //====================================================================
 // Class Difference member functions
-
-void Difference::resizeD()
-{
-        dataD = new Byte[bufSize];
-}
-
-//--------------------------------------------------------------------
+//
 // Compute differences  ##:u
 
-int Difference::compute(Command cmd)
+void Difference::compute()
 {
-        haveDiff = 0;
         memset(dataD, 0, bufSize);
 
-        if (! file1D->dataSize) {
-                file1.moveToEnd();
-        }
+        int size1 = file1D->dataSize,
+            size2 = file2D->dataSize;
 
-        if (! file2D->dataSize) {
-                file2.moveToEnd();
-        }
+        Byte *buf1 = file1D->dataF,
+             *buf2 = file2D->dataF,
+             *data = dataD;  // enregister
 
-        const Byte *buf1 = file1D->dataF,
-                   *buf2 = file2D->dataF;
-
-        int size = min(file1D->dataSize, file2D->dataSize);
+        int size = min(size1, size2);
 
         int diff = 0;
         for (; diff < size; ++diff) {
                 if (*buf1++ != *buf2++) {
-                        dataD[diff] = true;
-                        haveDiff++;
+                        data[diff] = true;
                 }
         }
 
-        size = max(file1D->dataSize, file2D->dataSize);
+        size = max(size1, size2);
 
-        for (; diff < size; ++diff) {
-                dataD[diff] = true;
-                haveDiff++;
+        if (diff < size) {
+                memset(data + diff, true, size - diff);
         }
 
-        if (cmd == cmPrevDiff && (! file1D->offset || ! file2D->offset)) {
-                return 1;
-        }
-
-        if (cmd == cmNextDiff && (file1D->dataSize < bufSize || file2D->dataSize < bufSize)) {
-                haveDiff = -1;  // move anyway
-        }
-
-        return haveDiff;
+        haveDiff = true;
 } // end Difference::compute
 
 //--------------------------------------------------------------------
-// Speedup differ - diff in next/prev staticSize bytes
+// Search differences Next/Prev
 
-void Difference::speedup(int way)
+void Difference::differ(int cmd)
 {
-        if (way > 0) {
-                SeekFile(file1D->fd, file1D->offset);
-                SeekFile(file2D->fd, file2D->offset);
+        File fd1 = file1D->fd,
+             fd2 = file2D->fd;
 
-                while (file1D->offset + staticSize < file1.filesize &&
-                                file2D->offset + staticSize < file2.filesize && ! stopRead) {
-                        ReadFile(file1D->fd, bufFile1, staticSize);
-                        ReadFile(file2D->fd, bufFile2, staticSize);
+        FPos of1 = file1D->offset,
+             of2 = file2D->offset;
+
+        if (cmd == cmNextDiff) {
+                if (haveDiff) {  // advance
+                        Size diff = min(file1D->filesize - of1, file2D->filesize - of2);
+
+                        if (diff <= bufSize) {  // indent end
+                                file1.moveTo(of1 + diff - steps[cmmMovePage]);
+                                file2.moveTo(of2 + diff - steps[cmmMovePage]);
+
+                                return;
+                        }
+
+                        of1 += bufSize;
+                        of2 += bufSize;
+                }
+
+                else if (of1 == file1D->filesize && of2 == file2D->filesize) {
+                        file1.moveToEnd();
+                        file2.moveToEnd();
+
+                        return;
+                }
+
+                SeekFile(fd1, of1);
+                SeekFile(fd2, of2);
+
+                of1 -= of2;
+
+                Size size;
+                do {
+                        Size size1 = ReadFile(fd1, bufFile1, staticSize);
+                        Size size2 = ReadFile(fd2, bufFile2, staticSize);
+
+                        size = min(size1, size2);
+
+                        if (size < staticSize || stopRead) {
+                                break;
+                        }
 
                         if (memcmp(bufFile1, bufFile2, staticSize)) {
                                 break;
                         }
 
-                        file1D->offset += staticSize;
-                        file2D->offset += staticSize;
+                        of2 += staticSize;  // only one needed
+
+                } while (1);
+
+                Size i=0;
+                for (; i < size; i += 16) {
+                        Quad q1 = _mm_load_si128((Quad*) (bufFile1 + i)),
+                             q2 = _mm_load_si128((Quad*) (bufFile2 + i));
+
+                        q1 = _mm_cmpeq_epi8(q1, q2);
+
+                        if ((_mm_movemask_epi8(q1)) != 0xFFFF) {
+                                break;
+                        }
                 }
+
+                if (i > size) {
+                        i = size;
+                }
+
+                file1.moveTo(of2 + of1 + i);
+                file2.moveTo(of2       + i);
         }
+
         else {  // downwards
-                while (file1D->offset - staticSize > 0 &&
-                                file2D->offset - staticSize > 0 && ! stopRead) {
-                        SeekFile(file1D->fd, file1D->offset - staticSize);
-                        SeekFile(file2D->fd, file2D->offset - staticSize);
+                Size diff1 = 0,
+                     diff2 = 0,
+                     diff3 = min(of1, of2);
 
-                        ReadFile(file1D->fd, bufFile1, staticSize);
-                        ReadFile(file2D->fd, bufFile2, staticSize);
+                if (diff3 <= bufSize) {
+                        file1.move(-diff3);
+                        file2.move(-diff3);
+
+                        return;
+                }
+
+                do {
+                        of1 -= staticSize;
+                        of2 -= staticSize;
+
+                        if (of1 < 0) {
+                                diff1 = of1;
+                                of1   = 0;
+                        }
+
+                        if (of2 < 0) {
+                                diff2 = of2;
+                                of2   = 0;
+                        }
+
+                        SeekFile(fd1, of1);
+                        SeekFile(fd2, of2);
+
+                        ReadFile(fd1, bufFile1, staticSize);
+                        ReadFile(fd2, bufFile2, staticSize);
+
+                        if (of1 == 0 || of2 == 0 || stopRead) {
+                                break;
+                        }
 
                         if (memcmp(bufFile1, bufFile2, staticSize)) {
                                 break;
                         }
 
-                        file1D->offset -= staticSize;
-                        file2D->offset -= staticSize;
+                } while (1);
+
+                diff1 = staticSize - 1 + diff1;
+                diff2 = staticSize - 1 + diff2;
+
+                diff3 = diff1 - diff2;
+
+                if (diff3 > 0) {  // maintain offset
+                        of1   = of1 + diff3;
+                        diff1 = (Size) bufFile1 + diff3 - 15;
+                        diff3 = diff2;
+                        diff2 = (Size) bufFile2         - 15;
                 }
+                else {
+                        of2   = of2 - diff3;
+                        diff2 = (Size) bufFile2 - diff3 - 15;
+                        diff3 = diff1;
+                        diff1 = (Size) bufFile1         - 15;
+                }
+
+                for (; diff3 >= bufSize; diff3 -= 16) {  // use only one var
+                        Quad q1 = _mm_loadu_si128((Quad*) (diff1 + diff3)),
+                             q2 = _mm_loadu_si128((Quad*) (diff2 + diff3));
+
+                        q1 = _mm_cmpeq_epi8(q1, q2);
+
+                        if ((_mm_movemask_epi8(q1)) != 0xFFFF) {
+                                file1.moveTo(of1 + diff3 - bufSize + 1);
+                                file2.moveTo(of2 + diff3 - bufSize + 1);
+
+                                return;
+                        }
+                }
+
+                file1.moveTo(of1);
+                file2.moveTo(of2);
         }
-} // end Difference::speedup
+} // end Difference::differ
 
 //====================================================================
 // Class FileDisplay member functions
-
-FileDisplay::~FileDisplay()
-{
-        if (fd) {
-                close(fd);
-        }
-
-        delete [] dataF;
-
-        free(addr);
-}
-
-//--------------------------------------------------------------------
+//
 // Open a file for display
 
 bool FileDisplay::setFile(char* FileName)
 {
-        fileName = FileName;
+        filename = FileName;
 
-        File probe = OpenFile(fileName, true);
+        File probe = OpenFile(filename, true);
 
         if (probe > 0) {
                 editable = true;
                 close(probe);
         }
 
-        if ((fd = OpenFile(fileName)) < 0) {
+        if ((fd = OpenFile(filename)) < 0) {
                 return false;
         }
 
@@ -979,8 +1407,10 @@ bool FileDisplay::setFile(char* FileName)
 void FileDisplay::resizeF()
 {
         delete [] dataF;
+        delete [] sAllF;
 
-        dataF = new Byte[bufSize];
+        dataF = new Byte[bufSize];  // max_align_t 0x10
+        sAllF = new Byte[bufSize];
 }
 
 //--------------------------------------------------------------------
@@ -996,8 +1426,6 @@ void FileDisplay::initF(int y, const Difference* Diff)
         resizeF();
 
         moveTo(startAddr);
-
-        addr = (FPos*) calloc(numLines, sizeof(FPos));
 }
 
 //--------------------------------------------------------------------
@@ -1045,38 +1473,38 @@ void FileDisplay::display()
                 editable ? "RW" : "RO");
 
         short size_name = screenWidth - strlen(buf),
-              size_fname = strlen(fileName);
+              size_fname = strlen(filename);
 
         if (size_fname <= size_name) {
-                memcpy(bufStat, fileName, size_fname);
+                memcpy(bufStat, filename, size_fname);
         }
         else {
                 first = size_name / 4;
 
-                memcpy(bufStat, fileName, first);
+                memcpy(bufStat, filename, first);
                 memcpy(bufStat + first, " ... ", 5);
 
                 last = size_name - first - 5;
 
-                memcpy(bufStat + first + 5, fileName + size_fname - last, last);
+                memcpy(bufStat + first + 5, filename + size_fname - last, last);
         }
 
         memcpy(bufStat + size_name, buf, strlen(buf));
 
         cwinF.put(0, 0, bufStat);
-        cwinF.putAttribs(0, 0, cName, strlen(bufStat));
+        attr(0, 0, cName, strlen(bufStat));
 
         if (lockState == lockBottom && ! two) {
-                cwinF.putAttribs(0, 0, cHighFile, size_name);
+                attr(0, 0, cHighFile, size_name);
         }
         else if (lockState == lockTop && two) {
-                cwinF.putAttribs(0, 0, cHighFile, size_name);
+                attr(0, 0, cHighFile, size_name);
         }
 
         if (diffOffset < 0) {
                 char *pc = (char*) memchr(buf, '-', strlen(buf));
 
-                cwinF.putAttribs(size_name + (pc - buf), 0, cSearch, 1);
+                attr(size_name + (pc - buf), 0, cMatch, 1);
         }
 
         char bufHex[screenWidth + 1] = { 0 },
@@ -1086,8 +1514,8 @@ void FileDisplay::display()
                 memset(bufHex, ' ', screenWidth);
                 memset(bufAsc, ' ',   lineWidth);
 
-                if (*(addr + row)) {
-                        lineOffset += (lineWidth * (*(addr + row)));
+                if (*(sm4rt + row)) {
+                        lineOffset += (lineWidth * (*(sm4rt + row)));
                 }
 
                 char *pbufHex = bufHex;
@@ -1123,28 +1551,42 @@ void FileDisplay::display()
                                 break;
                         }
                 }
-                cwinF.putAttribs(col, row + 1, cAddress, (sizeTera ? 12 : 9) - col);
+                attr(col, row + 1, cAddress, (sizeTera ? 12 : 9) - col);
 
                 if (showRaster) {
                         if (sizeTera) {
-                                cwinF.putAttribs(0, row + 1, cRaster, 1);
+                                attr(0, row + 1, cRaster, 1);
                         }
-                        cwinF.putAttribs(sizeTera ? 4 : 1, row + 1, cRaster, 1);
-                        cwinF.putAttribs(sizeTera ? 8 : 5, row + 1, cRaster, 1);
+                        attr(sizeTera ? 4 : 1, row + 1, cRaster, 1);
+                        attr(sizeTera ? 8 : 5, row + 1, cRaster, 1);
                 }
 
                 if (! modeAscii && showRaster && bufHex[leftMar] != ' ') {
                         for (col=0; col <= lineWidth - 8; col += 8) {
-                                cwinF.putAttribs(leftMar  + col * 3 - 1, row + 1, cRaster, 1);
-                                cwinF.putAttribs(leftMar2 + col        , row + 1, cRaster, 1);
+                                attr(leftMar  + col * 3 - 1, row + 1, cRaster, 1);
+                                attr(leftMar2 + col        , row + 1, cRaster, 1);
                         }
                 }
 
                 if (haveDiff) {
                         for (col=0; col < lineWidth; ++col) {
                                 if (diffsF->dataD[row * lineWidth + col]) {
-                                        cwinF.putAttribs(leftMar  + col * 3, row + 1, cDiff, 2);
-                                        cwinF.putAttribs(leftMar2 + col    , row + 1, cDiff, 1);
+                                        attr(leftMar  + col * 3, row + 1, cDiff, 2);
+                                        attr(leftMar2 + col    , row + 1, cDiff, 1);
+                                }
+                        }
+                }
+
+                if (se4rchAll) {
+                        for (col=0; col < lineWidth; ++col) {
+                                if (sAllF[row * lineWidth + col]) {
+                                        if (modeAscii) {
+                                                attr(leftMar  + col    , row + 1, cMatch, 1);
+                                        }
+                                        else {
+                                                attr(leftMar  + col * 3, row + 1, cMatch, 2);
+                                                attr(leftMar2 + col    , row + 1, cMatch, 1);
+                                        }
                                 }
                         }
                 }
@@ -1152,23 +1594,37 @@ void FileDisplay::display()
                 if (se4rch && row >= (searchOff >= searchIndent ? searchIndent / lineWidth : 0)) {
                         for (col=0; se4rch && col < lineWidth; --se4rch, ++col) {
                                 if (modeAscii) {
-                                        cwinF.putAttribs(leftMar  + col    , row + 1, cSearch, 1);
+                                        attr(leftMar  + col    , row + 1, cSearch, 1);
                                 }
                                 else {
-                                        cwinF.putAttribs(leftMar  + col * 3, row + 1, cSearch, 2);
-                                        cwinF.putAttribs(leftMar2 + col    , row + 1, cSearch, 1);
+                                        attr(leftMar  + col * 3, row + 1, cSearch, 2);
+                                        attr(leftMar2 + col    , row + 1, cSearch, 1);
                                 }
                         }
                 }
 
-                if (*(addr + row)) {
-                        for (col=0; col < lineWidth; ++col) {
+                if (seekup) {
+                        if (seekup < 0 || row == numLines - 1) {
                                 if (modeAscii) {
-                                        cwinF.putAttribs(leftMar  + col    , row + 1, cDiff, 1);
+                                        attr(leftMar , row + 1, cSeek, 1);
                                 }
                                 else {
-                                        cwinF.putAttribs(leftMar  + col * 3, row + 1, cDiff, 2);
-                                        cwinF.putAttribs(leftMar2 + col    , row + 1, cDiff, 1);
+                                        attr(leftMar , row + 1, cSeek, 2);
+                                        attr(leftMar2, row + 1, cSeek, 1);
+                                }
+
+                                seekup = 0;
+                        }
+                }
+
+                if (*(sm4rt + row)) {
+                        for (col=0; col < lineWidth; ++col) {
+                                if (modeAscii) {
+                                        attr(leftMar  + col    , row + 1, cDiff, 1);
+                                }
+                                else {
+                                        attr(leftMar  + col * 3, row + 1, cDiff, 2);
+                                        attr(leftMar2 + col    , row + 1, cDiff, 1);
                                 }
                         }
                 }
@@ -1176,10 +1632,8 @@ void FileDisplay::display()
                 lineOffset += lineWidth;
         }
 
-        if (scrollOff) {
-                moveTo(offset);  // reload buffer
-
-                memset(addr, 0, numLines * sizeof(FPos));
+        if (se4rchAll) {
+                se4rchAll = false;
         }
 
         updateF();
@@ -1188,28 +1642,24 @@ void FileDisplay::display()
 //--------------------------------------------------------------------
 // Busy status
 
-void FileDisplay::busy(bool on=false, bool ic=false)
+void FileDisplay::busy(bool on=false, bool ic=false, bool np=false)
 {
+        if (! fd) {
+                return;
+        }
+
         if (on) {
-                cwinF.putAttribs(screenWidth - (ic ? 4 : 2),  0, cHighBusy, ic ? 1 : 2);
+                attr(screenWidth - (ic ? 4 : 2),  0, (np ? cHighBus2 : cHighBusy), ic ? 1 : 2);
                 updateF();
         }
         else {
                 napms(150);
-                cwinF.putAttribs(screenWidth - (ic ? 4 : 2),  0, cName, ic ? 1 : 2);
+                attr(screenWidth - (ic ? 4 : 2),  0, cName, ic ? 1 : 2);
 
                 if (! singleFile && ! two) {
                         updateF();
                 }
         }
-}
-
-//--------------------------------------------------------------------
-// Highlight statusbar
-
-void FileDisplay::highEdit(short count)
-{
-        cwinF.putAttribs(0, 0, cHighEdit, count);
 }
 
 //--------------------------------------------------------------------
@@ -1228,7 +1678,7 @@ void FileDisplay::editOut(short outOffset)
 
                 char *pbufHex = bufHex;
 
-                pbufHex += sprintf(pbufHex, "%0*lX  ", sizeTera ? 12 : 9, lineOffset);
+                pbufHex += sprintf(bufHex, "%0*lX  ", sizeTera ? 12 : 9, lineOffset);
 
                 int lineLength = min(lineWidth, (int) editBytes.size() - outOffset - row * lineWidth);
 
@@ -1248,21 +1698,21 @@ void FileDisplay::editOut(short outOffset)
                         int col[] = { 0, 1, 4, 5, 8 };
 
                         for (int i = sizeTera ? 0 : 1; i < 5; i += 2) {
-                                cwinF.putAttribs(col[i], row + 1, cRaster, 1);
+                                attr(col[i], row + 1, cRaster, 1);
                         }
                 }
 
                 if (showRaster && bufHex[leftMar] != ' ') {
                         for (int col=0; col <= lineWidth - 8; col += 8) {
-                                cwinF.putAttribs(leftMar  + col * 3 - 1, row + 1, cRaster, 1);
-                                cwinF.putAttribs(leftMar2 + col        , row + 1, cRaster, 1);
+                                attr(leftMar  + col * 3 - 1, row + 1, cRaster, 1);
+                                attr(leftMar2 + col        , row + 1, cRaster, 1);
                         }
                 }
 
                 for (int c, col=0; col < lineLength; ++col) {
                         if ((c = editColor[outOffset + row * lineWidth + col])) {
-                                cwinF.putAttribs(leftMar  + col * 3, row + 1, (Style) c, 2);
-                                cwinF.putAttribs(leftMar2 + col    , row + 1, (Style) c, 1);
+                                attr(leftMar  + col * 3, row + 1, (Style) c, 2);
+                                attr(leftMar2 + col    , row + 1, (Style) c, 1);
                         }
                 }
 
@@ -1338,7 +1788,7 @@ void FileDisplay::progress1()
 //--------------------------------------------------------------------
 // Progress bar multiple
 
-void FileDisplay::progress(wchar_t* bar, int count, int delay, int stint=1)
+void FileDisplay::progress(wchar_t* bar, int count, int delay=0, int stint=1)
 {
         int pos = count * stint / 8,
             sym = count * stint % 8;
@@ -1360,24 +1810,6 @@ void FileDisplay::progress(wchar_t* bar, int count, int delay, int stint=1)
 }
 
 //--------------------------------------------------------------------
-// Progress bar end (or debug profiling)
-
-Size FileDisplay::finish(int init=0)
-{
-        timespec ts;
-
-        clock_gettime(CLOCK_TAI, &ts);
-
-        if (init) {
-                laptime = ts.tv_sec * 1000000000 + ts.tv_nsec;
-
-                return 0;
-        }
-
-        return (ts.tv_sec * 1000000000 + ts.tv_nsec - laptime);
-}
-
-//--------------------------------------------------------------------
 // Append the remainder
 
 bool FileDisplay::WriteTail(FPos start)
@@ -1391,24 +1823,22 @@ bool FileDisplay::WriteTail(FPos start)
         int width = (screenWidth - 4) * 8,
             level = (screenWidth / 3) * 8,
             cargo = staticSize,
-            loops = remain / cargo,
+            loops = mCeil(remain, cargo),
+            multi = 1,
             scale = 0,
-            delay = 4,
             count = 0,
             stage = 0,
-            tally = 0,
+            round = 0,
             final = 0;
 
-        Size round = 0,
-             chunk = 0;
-
-        if (! loops) {
+        if (remain <= cargo) {
                 progress1();
+                multi = 0;
         }
 
         else if (loops > width) {
-                scale = loops / width + (loops % width ? 1 : 0);
-                width = loops / scale + (loops % scale ? 1 : 0);
+                scale = mCeil(loops, width);
+                width = mCeil(loops, scale);
         }
 
         else if (loops > level) {
@@ -1417,36 +1847,34 @@ bool FileDisplay::WriteTail(FPos start)
 
         else {
                 cargo = remain / level >> 12;
+                cargo = cargo ? cargo : 1;
                 cargo *= 4096;  // page align
 
-                width = remain / cargo;
+                width = mCeil(remain, cargo);
         }
 
         stage = width - 8;
 
-        width = width / 8 + (width % 8 ? 1 : 0);
+        width = mCeil(width, 8);
 
         wchar_t bar[width + 1];
         memset(bar, 0, sizeof(bar));
 
-        if (loops) {
-                positionInWin(two ? cmgGotoBottom : cmgGotoTop, 2+ width +2, "");
-        }
-
 #if SHOW_WRITE_SUMMARY
         int term = time(NULL);
 #endif
-        if (remain >= cargo) {
+        if (multi) {
+                Size laptime = 0,
+                     laps    = timer();
+
+                positionInWin(two ? cmgGotoBottom : cmgGotoTop, 2+ width +2, "");
+
                 if (insert) {
                         srcOff = filesize;  // downwards
                         dstOff = filesize + start - dataSize;
                 }
 
-                while (remain >= cargo) {
-                        if (mScale > stage) {  // use only the last ones for timekeeping
-                                finish(1);
-                        }
-
+                for (; remain > cargo; ++count) {  // two cases - one loop
                         if (insert) {
                                 srcOff -= cargo;
                         }
@@ -1470,25 +1898,28 @@ bool FileDisplay::WriteTail(FPos start)
 
                         remain -= cargo;
 
-                        if (mScale > stage) {
-                                round += finish() + 1;  // assure non-zero
-                        }
-
                         if (scale && count % scale) {
-                                count++;
                                 continue;
                         }
 
-                        if (round) {
-                                if (! scale || tally++) {  // discard single round
-                                        chunk += round;
-                                        final++;
+                        if (mScale >= stage) {
+                                if (mScale == stage) {
+                                        laptime = timer();
                                 }
-
-                                round = 0;
+                                else {
+                                        final = timer(3, laptime) / ++round;
+                                }
                         }
 
-                        progress(bar, mScaleInc, delay);
+                        progress(bar, mScale);
+
+                        laps = timer(3, laps);
+
+                        if (barDelay > laps) {
+                                napms(barDelay - laps);
+                        }
+
+                        laps = timer();
                 }
 
                 if (insert) {
@@ -1521,21 +1952,16 @@ bool FileDisplay::WriteTail(FPos start)
                         (filesize - offset) / 1048576 / (term ? term : 1));
         }
 #endif
-        if (loops) {
-                for (;;) {
+        if (multi) {
+                for (;mScale < width * 8; ++count) {
                         if (scale && count % scale) {
-                                ++count;
+                                continue;
                         }
 
-                        else if (mScale % 8) {  // neat finish
-                                progress(bar, mScaleInc, chunk / final / 1000000 + delay);
-                        }
-
-                        else {
-                                break;
-                        }
+                        progress(bar, mScale, final);  // neat finish
                 }
-                napms(600);
+
+                napms(400);
         }
 
         return true;
@@ -1769,7 +2195,7 @@ done:
                 bool ret = false;
 
                 close(fd);
-                fd = OpenFile(fileName, true);
+                fd = OpenFile(filename, true);
 
                 SeekFile(fd, offset);
 
@@ -1818,7 +2244,7 @@ done:
                         close(fd);
                 }
 
-                fd = OpenFile(fileName);
+                fd = OpenFile(filename);
 
                 filesize = SeekFile(fd, 0, SEEK_END);
 
@@ -1889,6 +2315,38 @@ void FileDisplay::sync(const FileDisplay* other)
 }
 
 //--------------------------------------------------------------------
+// Mark all search strings
+
+void FileDisplay::mark(Byte* searchFor, Size searchLen)
+{
+        Byte ign[dataSize];
+
+        Byte* src = ignoreCase ? ign : dataF;
+
+        if (ignoreCase) {
+                memcpy(ign, dataF, dataSize);
+
+                lowCase(ign, dataSize);
+        }
+
+        memset(sAllF, 0, bufSize);
+
+        for (int i=0; i < dataSize; ++i) {
+                Byte* p;
+
+                if ((p = (Byte*) memmem(src + i, dataSize - i, searchFor, searchLen))) {
+                        for (int j=0; j < searchLen; ++j) {
+                                *(sAllF + (p - src) + j) = true;
+                        }
+
+                        i += searchLen - 1;
+                }
+        }
+
+        se4rchAll = true;
+}
+
+//--------------------------------------------------------------------
 // Change the file position  ##:to
 
 void FileDisplay::moveTo(FPos newOffset)
@@ -1911,11 +2369,19 @@ void FileDisplay::moveTo(FPos newOffset)
 //--------------------------------------------------------------------
 // Change the file position by searching
 
-void FileDisplay::moveForw(const Byte* searchFor, Size searchLen)
+void FileDisplay::moveForw(Byte* searchFor, Size searchLen)
 {
         FPos newPos = searchOff > 0 ? searchOff + 1 : (searchOff < 0 ? 1 : offset);
-        Full leader = 0;
-        Size bias   = 0;
+
+        Size bias = 0,
+             hint = 0;
+
+        Quad lead = _mm_setzero_si128(),
+             mask = _mm_set1_epi8(0xFF);
+
+        for (Full i=0; i < (Full) searchLen % 16; ++i) {  // shl128 only with immediate
+                mask = _mm_bslli_si128(mask, 1);
+        }
 
         while (! *(searchFor + bias) && bias < searchLen) {
                 ++bias;
@@ -1925,13 +2391,13 @@ void FileDisplay::moveForw(const Byte* searchFor, Size searchLen)
                 bias = 0;
         }
         else {
-                for (Size i=0; i < 8; ++i) {
-                        leader = leader << 8 | *(searchFor + bias);
-                }
+                lead = _mm_set1_epi8(*(searchFor + bias));
+                hint = 1;
         }
 
-        for (;;) {
+        for (; ; newPos += staticSize - searchLen + 1) {
                 SeekFile(fd, newPos);
+
                 Size bytesRead = ReadFile(fd, buffer, staticSize);
 
                 if (bytesRead < searchLen || stopRead) {
@@ -1942,79 +2408,96 @@ void FileDisplay::moveForw(const Byte* searchFor, Size searchLen)
                         lowCase(buffer, bytesRead);
                 }
 
-                for (Size i=0; i <= bytesRead - searchLen; ++i) {
-                        Full turbo = *(Full*) (buffer + i + bias);
+                for (Size i=0, todo=0, c; i <= bytesRead - searchLen; i += 16) {
+                        Quad turbo = _mm_loadu_si128((Quad*) (buffer + i + bias)),
+                             zero  = _mm_setzero_si128(),
+                             temp  = _mm_cmpeq_epi8(turbo, zero);
 
-                        if (! turbo) {
-                                if (leader) {
-                                        goto incr;
-                                }
-                                else {
-                                        goto skip;
+                        if (_mm_movemask_epi8(temp) == 0xFFFF) {
+                                if (hint) {
+                                        continue;
                                 }
                         }
 
-                        turbo ^= leader;
-
-                        if      (! (turbo & 0x00000000000000FF)) { i += 0; }
-                        else if (! (turbo & 0x000000000000FF00)) { i += 1; }
-                        else if (! (turbo & 0x0000000000FF0000)) { i += 2; }
-                        else if (! (turbo & 0x00000000FF000000)) { i += 3; }
-                        else if (! (turbo & 0x000000FF00000000)) { i += 4; }
-                        else if (! (turbo & 0x0000FF0000000000)) { i += 5; }
-                        else if (! (turbo & 0x00FF000000000000)) { i += 6; }
-                        else if (! (turbo & 0xFF00000000000000)) { i += 7; }
                         else {
-incr:                           i += 7;
-cont:                           continue;
+                                temp = _mm_cmpeq_epi8(turbo, lead);
                         }
 
-skip:                   if (searchFor[searchLen - 1] == buffer[i + searchLen - 1]) {
-                                Size j = 0;
-                                for (; j + 7 < searchLen; j+=8) {
-                                        if (*(Full*) (searchFor  + j) !=
-                                            *(Full*) (buffer + i + j)) {
-                                                goto cont;
-                                        }
-                                }
-
-                                if (searchLen != j) {  // shl mask 63
-                                        if ((*(Full*) (searchFor  + j) ^
-                                             *(Full*) (buffer + i + j) )
-                                             << 8 * (8 - searchLen + j)) {
-                                                goto cont;
-                                        }
-                                }
-
-                                if (i > bytesRead - searchLen) {  // limit turbo
-                                        goto cont;
-                                }
-
-                                newPos    = newPos + i;
-                                searchOff = newPos ? newPos : -1;  // tri-state
-                                se4rch    = searchLen;
-
-                                moveTo(newPos - (searchOff >= searchIndent ? searchIndent : 0));
-                                return;
+                        if (! (todo = _mm_movemask_epi8(temp))) {
+                                continue;
                         }
+
+                        do {
+                                c = i + _bit_scan_forward(todo);
+
+                                if (searchFor[searchLen - 1] == buffer[c + searchLen - 1]) {
+                                        Size j = 0;
+                                        Quad s,
+                                             b;
+
+                                        do {
+                                                s = _mm_loadu_si128((Quad*) (searchFor  + j));
+                                                b = _mm_loadu_si128((Quad*) (buffer + c + j));
+
+                                                if (searchLen < j + 16) {
+                                                        break;
+                                                }
+
+                                                temp = _mm_cmpeq_epi8(s, b);
+
+                                                if (_mm_movemask_epi8(temp) != 0xFFFF) {
+                                                        goto next;
+                                                }
+
+                                        } while (j += 16);
+
+                                        temp = _mm_cmpeq_epi8(s, b);
+                                        temp = _mm_or_si128(temp, mask);
+
+                                        if (_mm_movemask_epi8(temp) != 0xFFFF) {
+                                                goto next;
+                                        }
+
+                                        if (c <= bytesRead - searchLen) {  // limit turbo
+                                                newPos    = newPos + c;
+                                                searchOff = newPos ? newPos : -1;  // tri-state
+                                                se4rch    = searchLen;
+
+                                                moveTo(newPos - (searchOff >= searchIndent ? searchIndent : 0));
+
+                                                mark(searchFor, searchLen);
+                                                return;
+                                        }
+                                }
+next:
+                                asm ("btr{q %1, %0 | %0, %1}" : "+r" (todo) : "r" (c - i));  // use full line
+
+                        } while (todo);
                 }
-
-                newPos += staticSize - searchLen + 1;
         }
 
-        moveTo(stopRead ? newPos : filesize);
-
         searchOff = 0;
+
+        moveTo(stopRead ? newPos : filesize);
 } // end FileDisplay::moveForw
 
 //--------------------------------------------------------------------
 // Change the file position by searching backwards
 
-void FileDisplay::moveBack(const Byte* searchFor, Size searchLen)
+void FileDisplay::moveBack(Byte* searchFor, Size searchLen)
 {
         FPos newPos = searchOff > 0 ? searchOff : offset;
-        Full leader = 0;
-        Size bias   = 0;
+
+        Size bias = 0,
+             hint = 0,
+             diff = 0;
+
+        Quad lead = _mm_setzero_si128(),
+             mask = _mm_set1_epi8(0xFF);
+
+        for (Full i=0; i < (Full) searchLen % 16; ++i) {
+                mask = _mm_bslli_si128(mask, 1);
+        }
 
         while (! *(searchFor + bias) && bias < searchLen) {
                 ++bias;
@@ -2024,9 +2507,8 @@ void FileDisplay::moveBack(const Byte* searchFor, Size searchLen)
                 bias = 0;
         }
         else {
-                for (Size i=0; i < 8; ++i) {
-                        leader = leader << 8 | *(searchFor + bias);
-                }
+                lead = _mm_set1_epi8(*(searchFor + bias));
+                hint = 1;
         }
 
         if (newPos + searchLen - 1 > filesize) {
@@ -2034,242 +2516,329 @@ void FileDisplay::moveBack(const Byte* searchFor, Size searchLen)
         }
 
         for (;;) {
-                newPos -= staticSize - searchLen + 1;
+                newPos -= (staticSize - searchLen + 1);
 
-                SeekFile(fd, newPos > 0 ? newPos : 0);
+                if (newPos < 0) {
+                        diff   = newPos;
+                        newPos = 0;
+                }
+
+                SeekFile(fd, newPos);
+
                 Size bytesRead = ReadFile(fd, buffer, staticSize);
 
                 if (ignoreCase) {
                         lowCase(buffer, bytesRead);
                 }
 
-                for (Size i = staticSize + (newPos < 0 ? newPos : 0) - searchLen; i >= 0; --i) {
-                        Full turbo = *(Full*) (buffer + i + bias - 7);
+                for (Size i = staticSize - searchLen + diff, todo=0, c; i >= 0; i -= 16) {
+                        Quad turbo = _mm_loadu_si128((Quad*) (buffer + i + bias - 15)),
+                             zero  = _mm_setzero_si128(),
+                             temp  = _mm_cmpeq_epi8(turbo, zero);
 
-                        if (! turbo) {
-                                if (leader) {
-                                        goto decr;
-                                }
-                                else {
-                                        goto skip;
+                        if (_mm_movemask_epi8(temp) == 0xFFFF) {
+                                if (hint) {
+                                        continue;
                                 }
                         }
 
-                        turbo ^= leader;
-
-                        if      (! (turbo & 0xFF00000000000000)) { i -= 0; }
-                        else if (! (turbo & 0x00FF000000000000)) { i -= 1; }
-                        else if (! (turbo & 0x0000FF0000000000)) { i -= 2; }
-                        else if (! (turbo & 0x000000FF00000000)) { i -= 3; }
-                        else if (! (turbo & 0x00000000FF000000)) { i -= 4; }
-                        else if (! (turbo & 0x0000000000FF0000)) { i -= 5; }
-                        else if (! (turbo & 0x000000000000FF00)) { i -= 6; }
-                        else if (! (turbo & 0x00000000000000FF)) { i -= 7; }
                         else {
-decr:                           i -= 7;
-cont:                           continue;
+                                temp = _mm_cmpeq_epi8(turbo, lead);
                         }
 
-skip:                   if (searchFor[searchLen - 1] == buffer[i + searchLen - 1]) {
-                                Size j = 0;
-                                for (; j + 7 < searchLen; j+=8) {
-                                        if (*(Full*) (searchFor  + j) !=
-                                            *(Full*) (buffer + i + j)) {
-                                                goto cont;
-                                        }
-                                }
-
-                                if (searchLen != j) {
-                                        if ((*(Full*) (searchFor  + j) ^
-                                             *(Full*) (buffer + i + j) )
-                                             << 8 * (8 - searchLen + j)) {
-                                                goto cont;
-                                        }
-                                }
-
-                                if (i < 0) {
-                                        goto cont;
-                                }
-
-                                newPos    = (newPos > 0 ? newPos : 0) + i;
-                                searchOff = newPos ? newPos : -1;
-                                se4rch    = searchLen;
-
-                                moveTo(newPos - (searchOff >= searchIndent ? searchIndent : 0));
-                                return;
+                        if (! (todo = _mm_movemask_epi8(temp))) {
+                                continue;
                         }
+
+                        do {
+                                c = i - 15 + _bit_scan_reverse(todo);
+
+                                if (searchFor[searchLen - 1] == buffer[c + searchLen - 1]) {
+                                        Size j = 0;
+                                        Quad s,
+                                             b;
+
+                                        do {
+                                                s = _mm_loadu_si128((Quad*) (searchFor  + j));
+                                                b = _mm_loadu_si128((Quad*) (buffer + c + j));
+
+                                                if (searchLen < j + 16) {
+                                                        break;
+                                                }
+
+                                                temp = _mm_cmpeq_epi8(s, b);
+
+                                                if (_mm_movemask_epi8(temp) != 0xFFFF) {
+                                                        goto next;
+                                                }
+
+                                        } while (j += 16);
+
+                                        temp = _mm_cmpeq_epi8(s, b);
+                                        temp = _mm_or_si128(temp, mask);
+
+                                        if (_mm_movemask_epi8(temp) != 0xFFFF) {
+                                                goto next;
+                                        }
+
+                                        if (c >= 0) {
+                                                newPos    = newPos + c;
+                                                searchOff = newPos ? newPos : -1;
+                                                se4rch    = searchLen;
+
+                                                moveTo(newPos - (searchOff >= searchIndent ? searchIndent : 0));
+
+                                                mark(searchFor, searchLen);
+                                                return;
+                                        }
+                                }
+next:
+                                asm ("btr{q %1, %0 | %0, %1}" : "+r" (todo) : "r" (c - i + 15));
+
+                        } while (todo);
                 }
 
-                if (newPos <= 0 || stopRead) {
+                if (! newPos || stopRead) {
                         break;
                 }
         }
 
-        moveTo(stopRead ? newPos : 0);
-
         searchOff = 0;
+
+        moveTo(newPos);
 } // end FileDisplay::moveBack
 
 //--------------------------------------------------------------------
-// Seek to next byte not equal to current head
+// Seek forward to next byte not equal to current head + bufSize
 
-void FileDisplay::seekNotChar(bool upwards=false)
+void FileDisplay::seekForw()
 {
-        const int blockSize = 1024 * 1024;
-        Byte *const searchBuf = new Byte[blockSize];
+        Byte *pTakeThat = dataF + dataSize - 1,
+              searchFor = modeAscii && ! isprint(*pTakeThat) ? ' ' : *pTakeThat;
 
-        Byte searchFor = *dataF;
-        if (modeAscii && ! isprint(searchFor)) { searchFor = ' '; }
+        Quad lead = _mm_set1_epi8(searchFor);
 
-        FPos newPos = upwards ? offset - blockSize : offset + 1;
-        int bytesRead;
-        int diff = 0, here = -1;
+        FPos newPos = offset + dataSize;
 
-        for (;;) {
-                if (newPos < 0) { diff = newPos; newPos = 0; }
+        Size here = -1;
+
+        for (Size bytesRead; ; newPos += staticSize) {
                 SeekFile(fd, newPos);
-                if (((bytesRead = ReadFile(fd, searchBuf, blockSize)) <= 0) || stopRead) break;
+
+                bytesRead = ReadFile(fd, buffer, staticSize);
+
+                if (bytesRead <= 0 || stopRead) {
+                        break;
+                }
 
                 if (modeAscii) {
-                        for (int i=0; i < bytesRead; ++i) {
-                                if (! ((unsigned) searchBuf[i] - ' ' < '_')) {
-                                        searchBuf[i] = ' ';
-                                }
-                        }
+                        setAscii(bytesRead);
                 }
 
-                if (upwards) {
-                        for (int i = blockSize - 1 + diff; i >= 0; --i) {
-                                if (searchBuf[i] != searchFor) {
-                                        here = i; goto done;
-                                }
+                for (Size i=0, m; i < bytesRead; i += 16) {
+                        Quad turbo = _mm_load_si128((Quad*) (buffer + i));  // aligned
+
+                             turbo = _mm_cmpeq_epi8(turbo, lead);
+
+                        if ((m = _mm_movemask_epi8(turbo)) != 0xFFFF) {
+                                here = i + _bit_scan_forward((Word) ~m);
+
+                                goto done;
                         }
-                        if (! newPos) break;
-                        newPos -= blockSize;
-                }
-                else {
-                        for (int i=0; i < bytesRead; ++i) {
-                                if (searchBuf[i] != searchFor) {
-                                        here = i; goto done;
-                                }
-                        }
-                        newPos += blockSize;
                 }
         }
 done:
-        delete [] searchBuf;
-        if      (here >= 0) { moveTo(newPos + here); se4rch = 1; }
-        else if (stopRead)  { moveTo(newPos); }
-        else if (upwards)   { moveTo(0); }
-        else                { moveToEnd(); }
-} // end FileDisplay::seekNotChar
+        if (here >= 0) {
+                seekup = -1;
+
+                moveTo(newPos + here);
+        }
+
+        else if (stopRead) {
+                moveTo(newPos);
+        }
+
+        else {
+                moveToEnd();
+        }
+} // end FileDisplay::seekForw
+
+//--------------------------------------------------------------------
+// Seek backward to next byte not equal to current head
+
+void FileDisplay::seekBack()
+{
+        Byte searchFor = modeAscii && ! isprint(*dataF) ? ' ' : *dataF;
+
+        Quad lead = _mm_set1_epi8(searchFor);
+
+        FPos newPos = offset - staticSize;
+
+        Size diff =  0,
+             here = -1;
+
+        for (Size bytesRead; ; newPos -= staticSize) {
+                if (newPos < 0) {
+                        diff   = newPos;
+                        newPos = 0;
+                }
+
+                SeekFile(fd, newPos);
+
+                if ((bytesRead = ReadFile(fd, buffer, staticSize)) <= 0) {
+                        break;
+                }
+
+                if (modeAscii) {
+                        setAscii(bytesRead);
+                }
+
+                for (Size i = staticSize - 1 + diff, m; i >= 0; i -= 16) {
+                        Quad turbo = _mm_loadu_si128((Quad*) (buffer + i - 15));
+
+                             turbo = _mm_cmpeq_epi8(turbo, lead);
+
+                        if ((m = _mm_movemask_epi8(turbo)) != 0xFFFF) {
+                                here = i + _bit_scan_reverse((Word) ~m) - 15;
+
+                                goto done;
+                        }
+                }
+
+                if (! newPos || stopRead) {
+                        break;
+                }
+        }
+done:
+        if (here >= 0) {
+                newPos += here - steps[cmmMovePage];
+
+                if (newPos >= 0) {
+                        seekup = 1;
+                }
+
+                moveTo(newPos);
+        }
+
+        else if (stopRead) {
+                moveTo(newPos);
+        }
+
+        else {
+                moveTo(0);
+        }
+} // end FileDisplay::seekBack
 
 //--------------------------------------------------------------------
 // Scroll forward with skipping same content lines
 
 void FileDisplay::smartScroll()
 {
-        FPos newPos = scrollOff ? scrollOff : (offset & ~0xF) + steps[cmmMovePage];
+        bool (*pCmp) (Byte*, Byte*, Full) = lineWidth == 24 ? cmpLineU : cmpLine;
 
-        if (filesize - newPos < bufSize) {
-                scrollOff = 0;
-                moveTo(newPos);
+        FPos newPos = scrollOff;
 
-                if (! dataSize) {
-                        moveToEnd();
-                }
-                return;
-        }
-        offset = newPos;
+        if (! newPos) {  // advance
+                newPos = offset & ~0xF;
 
-        const int blockSize = 1000 * bufSize;
-        Byte* scrollBuf = new Byte[blockSize];
+                if (filesize - newPos > steps[cmmMovePage]) {
+                        moveTo(newPos);
 
-        Byte buf[lineWidth];
-        FPos repeat = 0;
+                        newPos += steps[cmmMovePage];
 
-        SeekFile(fd, newPos);
-        int bytesRead = ReadFile(fd, scrollBuf, blockSize);
+                        Size end = (Size) dataF + (numLines - 1) * lineWidth;
 
-        memcpy(dataF, scrollBuf, lineWidth);
-        bytesRead -= lineWidth;
-
-        if (modeAscii) {
-                for (int i=0; i < lineWidth; ++i) {
-                        if (! isprint(dataF[i])) {
-                                dataF[i] = ' ';
-                        }
-                }
-        }
-
-        int i = 1, j = 1;
-        for (; bytesRead > 0;) {
-                if (bytesRead >= lineWidth) {
-                        memcpy(buf, scrollBuf + j * lineWidth, lineWidth);
-
-                        if (modeAscii) {
-                                for (int k=0; k < lineWidth; ++k) {
-                                        if (! isprint(buf[k])) {
-                                                buf[k] = ' ';
-                                        }
+                        for (Byte* p = dataF; (Size) p < end; p += lineWidth) {  // scroll if possible
+                                if (! pCmp(p, p + lineWidth, lineWidth)) {
+                                        newPos -= steps[cmmMovePage];
+                                        break;
                                 }
                         }
+                }
+        }
 
-                        if (memcmp(dataF + (i - 1) * lineWidth, buf, lineWidth)) {
-                                memcpy(dataF + i * lineWidth, buf, lineWidth);
+        if (filesize - newPos <= steps[cmmMovePage]) {
+                moveToEnd();
 
-                                *(addr + i) = repeat;
+                scrollOff = 0;
+                return;
+        }
+
+        offset = newPos;
+
+        SeekFile(fd, newPos);
+
+        Size bytesRead = ReadFile(fd, buffer, staticSize);
+
+        if (modeAscii) {
+                setAscii(bytesRead);
+        }
+
+        FPos repeat = 0;
+
+        memcpy(dataF, buffer, lineWidth);
+        bytesRead -= lineWidth;
+
+        Size i = 1, j = 1;
+        for (; bytesRead > 0;) {
+                if (pCmp(dataF + (i - 1) * lineWidth, buffer + j * lineWidth, lineWidth)) {
+                        memcpy(dataF + i * lineWidth, buffer + j * lineWidth, lineWidth);
+
+                        if (repeat) {
+                                *(sm4rt + i) = repeat;
                                 repeat = 0;
-                                ++i;
-
-                        }
-                        else {
-                                ++repeat;
                         }
 
-                        if (i == numLines) {
-                                --i;
+                        if (i == numLines - 1) {
                                 break;
                         }
 
-                        bytesRead -= lineWidth;
-                        ++j;
+                        ++i;
                 }
+
+                else {
+                        ++repeat;
+                }
+
+                bytesRead -= lineWidth;
+                ++j;
 
                 if (bytesRead < lineWidth) {
                         newPos += j * lineWidth;
                         j = 0;
 
                         SeekFile(fd, newPos);
-                        bytesRead = ReadFile(fd, scrollBuf, blockSize);
 
-                        if (bytesRead > 0) {
-                                if (bytesRead < lineWidth || stopRead) {
-                                        *(addr + i) = repeat;
+                        bytesRead = ReadFile(fd, buffer, staticSize);
 
-                                        memcpy(dataF + i * lineWidth, scrollBuf, min(bytesRead, lineWidth));
-                                        break;
-                                }
-
+                        if (modeAscii) {
+                                setAscii(bytesRead);
                         }
 
-                        else {
-                                if (repeat) {
-                                        *(addr + i) = --repeat;
+                        if (bytesRead < lineWidth || stopRead) {
+                                if (bytesRead > 0) {
+                                        *(sm4rt + i) = repeat;
 
-                                        memcpy(dataF + i * lineWidth, dataF + (i - 1) * lineWidth, lineWidth);
-                                        ++i;
+                                        memcpy(dataF + i * lineWidth, buffer, min(bytesRead, lineWidth));
                                 }
+
+                                else {
+                                        if (repeat) {
+                                                *(sm4rt + i) = --repeat;
+
+                                                memcpy(dataF + i * lineWidth, dataF + (i - 1) * lineWidth, lineWidth);
+                                                ++i;  // tricky!
+                                        }
+                                }
+
+                                break;
                         }
                 }
         }
 
-        /* Gosh! All 4 exit points land here. */
         scrollOff = newPos + j * lineWidth;
 
         dataSize = i * lineWidth + min(bytesRead, lineWidth);
-
-        delete [] scrollBuf;
 } // end FileDisplay::smartScroll
 
 //====================================================================
@@ -2535,6 +3104,10 @@ void setup()
 {
         calcScreenLayout();  // global vars
 
+        if (__builtin_cpu_supports("sse2")) {  // sse2 is default on
+                useSSE2 = true;
+        }
+
         if (! (winInput = newwin(3, inWidth, 0, 0))) {
                 exitMsg(22, "Failed to create input window.");
         }
@@ -2549,8 +3122,9 @@ void setup()
         wbkgd(winHelp, attribStyle[cHelpWin]);
         box(winHelp, 0, 0);
 
-        mvwaddstr(winHelp, 0,              (helpWidth - 6)                   / 2, " Help ");
+        mvwaddstr(winHelp,              0, (helpWidth - 6)                   / 2, " Help ");
         mvwaddstr(winHelp, helpHeight - 1, (helpWidth - strlen(helpVersion)) / 2, helpVersion);
+        mvwaddstr(winHelp, helpHeight - 1, (helpWidth - 8)                      , useSSE2 ? "SSE2" : "");
 
         for (int i=0; i < helpHeight - 2; ++i) {  // exclude border
                 mvwaddstr(winHelp, i + 1, 1, aHelp[i]);
@@ -2563,6 +3137,8 @@ void setup()
         if (! singleFile) {
                 diffs.resizeD();
         }
+
+        sm4rt = (FPos*) calloc(numLines, sizeof(FPos));
 
         file1.initF(0, (singleFile ? NULL : &diffs));
 
@@ -2588,14 +3164,14 @@ void ee()
                         int key = wgetch(winInput);
 
                         switch (key) {
-                                case KEY_UP:     if (naps < 50) ++naps; break;
-                                case KEY_DOWN:   if (naps >  0) --naps; break;
+                                case KEY_UP:      if (naps < 50) ++naps; break;
+                                case KEY_DOWN:    if (naps >  0) --naps; break;
 
-                                case KEY_LEFT:   if (blocks > 3) --blocks; file1.updateF(); break;
-                                case KEY_RIGHT:  if (blocks < screenWidth - 4) ++blocks;    break;
+                                case KEY_LEFT:    if (blocks > 3) --blocks; file1.updateF(); break;
+                                case KEY_RIGHT:   if (blocks < screenWidth - 4) ++blocks;    break;
 
                                 case KEY_ESCAPE:  file1.updateF(); return;
-                                default:          --i;
+                                default:          i--;
                         }
                 }
 
@@ -2614,6 +3190,95 @@ void ee()
                 napms(200);
         }
 }
+
+//--------------------------------------------------------------------
+// Process cmdline arguments
+
+void processArgs(int argc, char** argv)
+{
+        if (*argv[2] == '-') {
+                dumpMode = 1;
+
+                if (*++argv[2] == '-') {
+                        dumpMode = 2;
+                }
+
+                if (argv[3]) {
+                        Size tmp = strtol(argv[3], NULL, 0);
+
+                        if (strchr(argv[3], 'l')) {
+                                dumpLen = tmp;
+                        }
+                        else if (strchr(argv[3], 'w')) {
+                                dumpWid = tmp;
+                        }
+                        else {
+                                dumpBeg = tmp;
+                        }
+
+                        if (argv[4]) {
+                                tmp = strtol(argv[4], NULL, 0);
+
+                                if (strchr(argv[4], 'l')) {
+                                        dumpLen = tmp;
+                                }
+                                else if (strchr(argv[4], 'w')) {
+                                        dumpWid = tmp;
+                                }
+                                else {
+                                        dumpEnd = tmp;
+                                }
+
+                                if (argv[5]) {
+                                        dumpWid = strtol(argv[5], NULL, 0);
+                                }
+                        }
+                }
+
+                if (dumpWid <= 0) {
+                        dumpWid = dumpDef;
+                }
+        }
+
+        else if (argv[3] && *argv[3] == '-') {
+                if (*++argv[3] == '-') {
+                        diffMode = 2;
+                }
+                else {
+                        diffMode = 1;
+                }
+
+                singleFile = false;
+        }
+
+        else {
+                File probe = OpenFile(argv[2]);
+
+                if (probe > 0) {
+                        singleFile = false;
+
+                        close(probe);
+                }
+                else {
+                        file1.startAddr = strtol(argv[2], NULL, 0);
+
+                        if (! file1.startAddr) {
+                                singleFile = false;  // error
+                        }
+                }
+
+                if (! singleFile && argv[3]) {
+                        file1.startAddr = strtol(argv[3], NULL, 0);
+
+                        if (argv[4]) {
+                                file2.startAddr = strtol(argv[4], NULL, 0);
+                        }
+                        else {
+                                file2.startAddr = file1.startAddr;
+                        }
+                }
+        }
+} // end processArgs
 
 //--------------------------------------------------------------------
 // Get a file position and move there  ##:p
@@ -2661,11 +3326,11 @@ void gotoPosition(Command cmd)
         }
 
         else if (strpbrk(buf, "ABCDEFXabcdefx")) {
-              pos1 = pos2 = strtoull(buf, NULL, 16);
+              pos1 = pos2 = strtol(buf, NULL, 16);
         }
 
         else {
-              pos1 = pos2 = strtoull(buf, NULL, 10);
+              pos1 = pos2 = strtol(buf, NULL, 10);
         }
 
         Size prefix = 1;
@@ -2793,29 +3458,30 @@ void searchFiles(Command cmd)
 
         if (cmd & cmfFindPrev || key == 'P') {
                 if (cmd & cmgGotoTop) {
-                        file1.busy(true);
+                        file1.busy(true, false, true);
 
                         file1.moveBack(searchPattern, lastSearch.size());
                         file1.busy();
                 }
 
                 if (cmd & cmgGotoBottom) {
-                        file2.busy(true);
+                        file2.busy(true, false, true);
 
                         file2.moveBack(searchPattern, lastSearch.size());
                         file2.busy();
                 }
         }
+
         else {
                 if (cmd & cmgGotoTop) {
-                        file1.busy(true);
+                        file1.busy(true, false, true);
 
                         file1.moveForw(searchPattern, lastSearch.size());
                         file1.busy();
                 }
 
                 if (cmd & cmgGotoBottom) {
-                        file2.busy(true);
+                        file2.busy(true, false, true);
 
                         file2.moveForw(searchPattern, lastSearch.size());
                         file2.busy();
@@ -2847,21 +3513,21 @@ void handleCmd(Command cmd)
                         }
                 }
 
-                else if (cmd & cmgGotoLSet) {
-                        if (cmd & cmgGotoTop) {
-                                file1.setLast();
-                        }
-                        if (cmd & cmgGotoBottom) {
-                                file2.setLast();
-                        }
-                }
-
                 else if ((cmd & cmgGotoMask) == cmgGotoLGet) {
                         if (cmd & cmgGotoTop) {
                                 file1.getLast();
                         }
                         if (cmd & cmgGotoBottom) {
                                 file2.getLast();
+                        }
+                }
+
+                else if ((cmd & cmgGotoMask) == cmgGotoLSet) {
+                        if (cmd & cmgGotoTop) {
+                                file1.setLast();
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                file2.setLast();
                         }
                 }
 
@@ -2883,6 +3549,26 @@ void handleCmd(Command cmd)
                         }
                 }
 
+                else if ((cmd & cmgGotoMask) == cmgGotoJGet) {
+                        if (cmd & cmgGotoTop) {
+                                file1.setLast();
+                                file1.moveTo(file1.startAddr);
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                file2.setLast();
+                                file2.moveTo(file2.startAddr);
+                        }
+                }
+
+                else if ((cmd & cmgGotoMask) == cmgGotoJSet) {
+                        if (cmd & cmgGotoTop) {
+                                file1.setJump();
+                        }
+                        if (cmd & cmgGotoBottom) {
+                                file2.setJump();
+                        }
+                }
+
                 else {
                         gotoPosition(cmd);
                 }
@@ -2893,14 +3579,14 @@ void handleCmd(Command cmd)
                         if (cmd & cmgGotoTop) {
                                 file1.busy(true);
 
-                                file1.seekNotChar();
+                                file1.seekForw();
                                 file1.busy();
                         }
 
                         if (cmd & cmgGotoBottom) {
                                 file2.busy(true);
 
-                                file2.seekNotChar();
+                                file2.seekForw();
                                 file2.busy();
                         }
                 }
@@ -2909,14 +3595,14 @@ void handleCmd(Command cmd)
                         if (cmd & cmgGotoTop) {
                                 file1.busy(true);
 
-                                file1.seekNotChar(true);
+                                file1.seekBack();
                                 file1.busy();
                         }
 
                         if (cmd & cmgGotoBottom) {
                                 file2.busy(true);
 
-                                file2.seekNotChar(true);
+                                file2.seekBack();
                                 file2.busy();
                         }
                 }
@@ -2949,6 +3635,10 @@ void handleCmd(Command cmd)
                         if (cmd & cmgGotoTop) {
                                 if (step) {
                                         file1.move(step);
+
+                                        if (haveDiff) {
+                                                diffs.compute();
+                                        }
                                 }
                                 else {
                                         file1.setLast();
@@ -2959,6 +3649,10 @@ void handleCmd(Command cmd)
                         if (cmd & cmgGotoBottom) {
                                 if (step) {
                                         file2.move(step);
+
+                                        if (haveDiff) {
+                                                diffs.compute();
+                                        }
                                 }
                                 else {
                                         file2.setLast();
@@ -2977,8 +3671,6 @@ void handleCmd(Command cmd)
         }
 
         else if (cmd == cmNextDiff || cmd == cmPrevDiff) {
-                int size = cmd == cmNextDiff ? bufSize : -bufSize;
-
                 if (lockState) {
                         lockState = lockNeither;
                 }
@@ -2986,24 +3678,9 @@ void handleCmd(Command cmd)
                 file1.busy(true);
                 file2.busy(true);
 
-                if (haveDiff) {
-                        file1.move(size);
-                        file2.move(size);
-                }
+                diffs.differ(cmd);
 
-                for (int go=1; ! diffs.compute(cmd) && ! stopRead; go=0) {
-                        if (go) {
-                                diffs.speedup(size);
-
-                                file1.move(0);
-                                file2.move(0);
-                        }
-
-                        else {
-                                file1.move(size);
-                                file2.move(size);
-                        }
-                }
+                diffs.compute();
 
                 file1.busy();
                 file2.busy();
@@ -3118,6 +3795,8 @@ Command getCommand()
                         case 'L':  cmd = cmgGoto | cmgGotoLSet; break;
                         case '.':  cmd = cmgGoto | cmgGotoLOff; break;
                         case ',':  cmd = cmgGoto | cmgGotoNOff; break;
+                        case '"':  cmd = cmgGoto | cmgGotoJGet; break;
+                        case 'J':  cmd = cmgGoto | cmgGotoJSet; break;
 
                         case 'E':  cmd = lockState == lockTop ? cmEditBottom : cmEditTop; break;
 
@@ -3168,18 +3847,27 @@ Command getCommand()
 
 int main(int argc, char* argv[])
 {
-        char* prog = strrchr(*argv, '/');
+        program = strrchr(*argv, '/');
 
-        prog = prog ? prog + 1 : *argv;
-
-        printf("%s\n\n", helpVersion + 1);
+        program = program ? program + 1 : *argv;
 
         if (argc == 1) {
-                printf("\t%s file [file2] [addr] [addr2]\n"
+                fprintf(stderr,
+                        "%s\n"
+                        "\n"
+                        "\t%s file [file2] [addr] [addr2]                     // ncurses\n"
+                        "\n"
+                        "\t%s file1 file2 -                                   // diff view\n"
+                        "\n"
+                        "\t%s file1 file2 --                                  // diff return\n"
+                        "\n"
+                        "\t%s file -  [start [end]] [length{l$}] [width{w$}]  // dump ascii\n"
+                        "\n"
+                        "\t%s file -- [start [end]] [length{l$}]              // dump binary\n"
                         "\n"
                         "// type 'h' for help\n"
                         "\n",
-                        prog);
+                        helpVersion + 1, program, program, program, program, program);
 
                 exit(0);
         }
@@ -3187,31 +3875,29 @@ int main(int argc, char* argv[])
         singleFile = true;
 
         if (argc > 2) {
-                File probe = OpenFile(argv[2]);
-
-                if (probe > 0) {
-                        singleFile = false;
-                        close(probe);
-                }
-                else {
-                        file1.startAddr = strtoull(argv[2], NULL, 0);
-
-                        if (! file1.startAddr) {
-                                singleFile = false;  // error
-                        }
-                }
-
-                if (! singleFile && argv[3]) {
-                        file1.startAddr = strtoull(argv[3], NULL, 0);
-
-                        if (argv[4]) {
-                                file2.startAddr = strtoull(argv[4], NULL, 0);
-                        }
-                        else {
-                                file2.startAddr = file1.startAddr;
-                        }
-                }
+                processArgs(argc, argv);
         }
+
+        if (dumpMode) {
+                dumpFile(argv[1]);  // exit
+        }
+
+        if (diffMode) {
+                FPos ret = diffFile(argv[1], argv[2]);
+
+                if (ret == -1) {
+                        exit(0);  // equal
+                }
+
+                if (diffMode == 2) {
+                        exit(1);  // diff
+                }
+
+                file1.startAddr = ret;
+                file2.startAddr = ret;
+        }
+
+        fprintf(stderr, "%s\n\n", helpVersion + 1);
 
         if (! initialize()) {
                 err(11, "Unable to initialize ncurses");
@@ -3238,6 +3924,11 @@ int main(int argc, char* argv[])
 
         setup();
 
+        if (diffMode) {
+                diffs.differ(cmNextDiff);
+                diffs.compute();
+        }
+
         file1.display();
         file2.display();
 
@@ -3246,12 +3937,21 @@ int main(int argc, char* argv[])
                         file1.searchOff = file2.searchOff = 0;
                 }
 
-                if (! (cmd == cmNextDiff || cmd == cmPrevDiff)) {
-                        haveDiff = 0;
+                if (! (cmd == cmNextDiff || cmd == cmPrevDiff || cmd == cmShowRaster ||
+                        (((cmd & (cmgGoto | cmfFind | cmmMove)) == cmmMove) && steps[cmd & cmmMoveMask]))) {
+                                haveDiff = false;
                 }
 
-                if (cmd != cmSmartScroll) {
-                        file1.scrollOff = 0;
+                if (file1.scrollOff) {
+                        if (cmd != cmShowRaster) {
+                                file1.move(0);
+
+                                memset(sm4rt, 0, numLines * sizeof(FPos));
+                        }
+
+                        if (! (cmd == cmSmartScroll || cmd == cmShowRaster)) {
+                                file1.scrollOff = 0;
+                        }
                 }
         }
 
