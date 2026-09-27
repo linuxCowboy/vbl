@@ -20,6 +20,9 @@ elif [ "${1#${1%.S}}" = ".S" ]; then
 
 elif [ "$1" ]; then
         FILE="$1"
+
+else
+        exit
 fi
 
 [ -f "$FILE" ] &&
@@ -29,30 +32,10 @@ objdump --source-comment \
         --demangle \
         --line-numbers \
         --disassembler-color=on \
-        --no-show-raw-insn \
         --visualize-jumps=color \
                 "$FILE"
 
 #################################
-
-Xclusiv()  # cut Label: block
-{
-        perl -ne '
-                BEGIN {
-                        $r = "'$1'"
-                }
-
-                if (/^$r/) {
-                        while (<>) {
-                                if (/^\S/) {
-                                        last if not (/^$r/)
-                                }
-                        }
-                }
-
-                print
-        '
-}
 
 ASM_DIR="/tmp/VBL"
 
@@ -77,6 +60,8 @@ fi
 cat "$FILA"                             |
 c++filt                                 |
 
+sed '/section\s*.debug_info/,$d'        |
+
 sed '/^\s*\.cfi_/d'                     |
 sed '/^\s*\.loc /d'                     |
 sed '/^\.L[BEFV]/d'                     |
@@ -86,14 +71,10 @@ sed 's/_[0-9]\+/_d+/g'                  |
 sed 's/tmp[0-9]\+/tmpD+/g'              |
 sed '/#.*\.[0-9]/ s/\.[0-9]\+/.D+/g'    |
 
-Xclusiv ".Ldebug"                       |
-Xclusiv ".LLST"                         |
-Xclusiv ".LLRL"                         |
-
-        cat > "$LIST"  # test/debug expressions
+        cat > "$LIST" || exit 0  # test/debug expressions
 #        exit
 
-# kick line numbers + labels for "dwdiff old new"
+# kick line numbers/labels
 [ -f "$LIST" ] &&
 
 perl -pe '

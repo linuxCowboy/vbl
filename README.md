@@ -11,11 +11,15 @@ edit / insert / delete
 
 zero-tolerant _TurboSearch_ for SSD
 
-SIMD speedup
+Smartscroll
+
+memory slots
 
 diff mode
 
 dump mode
+
+SIMD speedup
 
 64-bit static + dynamic
 
@@ -48,9 +52,13 @@ Features:
  - Goto last offset `.`
  - Goto last offset neg `,`
  - Set  last address `l`
- - Set  last address auto `g` `f` `Home` `End`
  - Set  jump address `j`
  - Get  jump address `"`
+ - Set   memory slot `3` `4` `5` `6` `7` `8` `9`
+ - Get   memory slot `3` `4` `5` `6` `7` `8` `9`
+ - Reset memory slot `3` `4` `5` `6` `7` `8` `9`
+ - Reset all memory slots `0`
+ - Show  all memory slots `s`
  - Next difference `Enter`
  - Prev difference `#` `\`
  - Next different byte `PgDn`
@@ -65,6 +73,7 @@ Features:
  - Skip backward 1% `-`
  - ASCII-Mode (single mode) `a`
  - Column raster `r`
+ - Reload file `o`
  - Edit file `e`
  - Edit insert byte `Ins`
  - Edit delete byte `Del`
@@ -84,21 +93,38 @@ Only if you _exit_ the edit mode and there are changes and you _explicitly_ conf
 
 With inserted or deleted bytes, the write can be huge, so it happens always **in place**.
 
-The _last address_ is auto set with initial `Find`, `Goto` w/o relative, `home`/`end` or manual with `l`.
+The _last address_ is auto set and can be get with `'` or `<`.
 
-A fixed _jump address_ can be set with `j` and get with `"`; init with param + set last addr.
+A _fixed_ jump address can be set with `j` and get with `"`; init with param.
+
+A _single_ memory slot can be reset with _address 0_.
 
 The starting point for _seek next diff byte_ is bottom-right.
 
-The starting point for _seek prev diff byte_ is top-left; with added Page Up.
+The starting point for _seek prev diff byte_ is top-left; with added _Page Up_.
 
-A _pane offset difference_ remains during comparison.
+A pane offset difference _remains_ during comparison.
 
-`Goto` position is now 2** kmgt and 10** KMGT(S.I.); with added sector support.
+`Goto` position is now 2** kmgt and 10** KMGT(S.I.); with added _sector_ support.
 
 `Esc` can interrupt the searches.
 
 Only `q` quit the program.
+
+Memory slots:
+-------------
+
+```
+Key     Slot    Offset  Check               Last addr       Action
+---     ----    ------  -----               ---------       ------
+3-9     free    >0      addr not in slots                   set slot
+3-9     used    >0                          set to offset   get slot
+3-9     used     0      confirm reset       set to slot     set slot to 0
+0       used            confirm reset all                   set all  to 0
+s                                                           show all
+
+['<]                                                        get last addr
+```
 
 Build:
 ------
@@ -151,6 +177,9 @@ Screenshoots:
 ![Screenshot](pics/two.jpg)  
 *Two Files*
 
+![Screenshot](pics/slots.png)  
+*Memory Slots*
+
 ![Screenshot](pics/ask.png)  
 *You have to confirm long writes (>512MB)*
 
@@ -161,20 +190,19 @@ Cmdline:
 --------
 
 ```
-VBinDiff for Linux 4.4
+VBinDiff for Linux 4.6
 
 	vbl file [file2] [addr] [addr2]                     // ncurses
 
 	vbl file1 file2 -                                   // diff view
 
-	vbl file1 file2 --                                  // diff return
+	vbl file1 file2 --                                  // diff exit
 
 	vbl file -  [start [end]] [length{l$}] [width{w$}]  // dump ascii
 
 	vbl file -- [start [end]] [length{l$}]              // dump binary
 
 // type 'h' for help
-
 ```
 
 Shortcut:
