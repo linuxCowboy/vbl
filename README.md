@@ -15,6 +15,8 @@ Smartscroll
 
 memory slots
 
+ASCII mode
+
 diff mode
 
 dump mode
@@ -28,9 +30,9 @@ asm + disasm code
 Features:
 ---------
 
- - Ascii search `f`
- - Binary search
- - Forward search `n`
+ - Ascii    search `f`
+ - Binary   search
+ - Forward  search `n`
  - Backward search `p`
  - Case insensitive `i`
  - Search history `Up` `Dn`
@@ -39,6 +41,8 @@ Features:
  - Search indentation
  - Search interruption `Esc`
  - Visual feedback
+<br>
+
  - Goto position decimal `g`
  - Goto position percent
  - Goto position hex (abcd 0x1234 1234x)
@@ -47,39 +51,49 @@ Features:
  - Goto position *512 (s)
  - Goto position *4096 (S)
  - Goto position offset (+addr -addr)
+ - Goto last     offset `.`
+ - Goto last     offset neg `,`
  - Goto position history `Up` `Dn`
- - Goto last address `'` `<`
- - Goto last offset `.`
- - Goto last offset neg `,`
- - Set  last address `l`
- - Set  jump address `j`
- - Get  jump address `"`
+<br>
+
+ - Set last address `l`
+ - Get last address `'` `<`
+ - Set jump address `j`
+ - Get jump address `"`
  - Set   memory slot `3` `4` `5` `6` `7` `8` `9`
  - Get   memory slot `3` `4` `5` `6` `7` `8` `9`
  - Reset memory slot `3` `4` `5` `6` `7` `8` `9`
  - Reset all memory slots `0`
  - Show  all memory slots `s`
- - Next difference `Enter`
- - Prev difference `#` `\`
+<br>
+
+ - _Smartscroll_ (single mode) `ENTER`
  - Next different byte `PgDn`
  - Prev different byte `PgUp`
- - Sync 1. with 2. view `1`
- - Sync 2. with 1. view `2`
- - File position decimal
- - File position percent
- - File offset difference
- - _Smartscroll_ (single mode) `ENTER`
  - Skip forward 4% `+` `*` `=`
  - Skip backward 1% `-`
  - ASCII-Mode (single mode) `a`
- - Column raster `r`
- - Reload file `o`
+<br>
+
+ - Next difference `Enter`
+ - Prev difference `#` `\`
+ - Use only top file `t`
+ - Use only bottom file `b`
+ - Sync 1. with 2. view `1`
+ - Sync 2. with 1. view `2`
+<br>
+
  - Edit file `e`
  - Edit insert byte `Ins`
  - Edit delete byte `Del`
+<br>
+
+ - File position decimal
+ - File position percent
+ - File offset difference
  - RW/RO detection
- - Use only top file `t`
- - Use only bottom file `b`
+ - Reload file `o`
+ - Column raster `r`
  - Help window `h`
  - Quit `q`
  - Easter egg
@@ -106,6 +120,8 @@ The starting point for _seek prev diff byte_ is top-left; with added _Page Up_.
 A pane offset difference _remains_ during comparison.
 
 `Goto` position is now 2** kmgt and 10** KMGT(S.I.); with added _sector_ support.
+
+A _negative_ length param counts from end of file.
 
 `Esc` can interrupt the searches.
 
@@ -190,17 +206,21 @@ Cmdline:
 --------
 
 ```
-VBinDiff for Linux 4.6
+VBinDiff for Linux 4.7
 
-	vbl file [file2] [addr] [addr2]                     // ncurses
+	vbl file [file2] [addr] [addr2]                          // ncurses
 
-	vbl file1 file2 -                                   // diff view
 
-	vbl file1 file2 --                                  // diff exit
+	vbl file1 file2 -                                        // diff view
 
-	vbl file -  [start [end]] [length{l$}] [width{w$}]  // dump ascii
+	vbl file1 file2 --                                       // diff exit
 
-	vbl file -- [start [end]] [length{l$}]              // dump binary
+
+	vbl file        -   [start [end]] [len{l$}] [width{w$}]  // dump ascii
+
+	vbl file        --  [start [end]] [len{l$}]              // dump binary
+
+	vbl file1 file2 --- [start] [start2] [length{l$}]        // dump diff
 
 // type 'h' for help
 ```

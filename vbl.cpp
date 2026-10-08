@@ -49,6 +49,7 @@
 //      4.4     diff mode
 //      4.5     memory slots
 //      4.6     reload files
+//      4.7     dump diff
 //
 //   This program is free software; you can redistribute it and/or
 //   modify it under the terms of the GNU General Public License as
@@ -77,7 +78,7 @@
 
 using namespace std;
 
-#define VBL_VERSION     "4.6"
+#define VBL_VERSION     "4.7"
 
 // ###################
 // ##### options #####
@@ -299,6 +300,7 @@ const Size minScreenHeight = 24,  // Enforced minimum height
            skipBack = 1,  // Percent to skip backward
 
            staticSize = 1L << 25,  // size global buffers
+           outputSize = 1L << 10,  // lines stdout buffer
            warnResize = 1L << 29,  // confirmation threshold
 
            barDelay = 6,  // msec, smoothness vs. speed
@@ -379,7 +381,8 @@ Byte *buffer = bufFile1;
 
 FPos *sm4rt;
 
-char bufTimer[64];
+char bufTimer[64],
+     bufPrint[150 * outputSize];
 
 bool twoFiles,
      showRaster,
@@ -521,47 +524,135 @@ FPos SeekFile(File file, FPos position, int whence=SEEK_SET)
 //--------------------------------------------------------------------
 // Dumper (no curses)
 
-void dumpFile(char* file)
+void dumpFile(char* file, char* file2)
 {
-        File fd;
+        File fd, fd2;
+        Size size, size1, size2, len, cnt = 0;
 
         if ((fd = OpenFile(file)) < 0) {
                 err(2, file);
         }
 
-        if (! dumpLen) {
-                if (! dumpEnd) {
-                        dumpEnd = SeekFile(fd, 0, SEEK_END);
+        if ((size = SeekFile(fd, 0, SEEK_END)) < 0) {
+                err(3, "seek end");
+        }
+
+        if (dumpMode != 3) {
+               if (dumpLen < 0) {
+                        dumpBeg = size + dumpLen;
+                        dumpLen = -dumpLen;
                 }
 
-                dumpLen = dumpEnd - dumpBeg;
+                else if (! dumpLen) {
+                        if (! dumpEnd) {
+                                dumpEnd = size;
+                        }
+
+                        dumpLen = dumpEnd - dumpBeg;
+                }
         }
 
         if (SeekFile(fd, dumpBeg) < 0) {
-                err(3, "seek");
+                err(3, "seek set");
         }
 
-        Size bytesRead, cnt, len;
+        if (dumpMode == 3) {  // diff
+                if ((fd2 = OpenFile(file2)) < 0) {
+                        err(2, file2);
+                }
 
-        if (dumpMode == 2) {  // binary
-                Byte* pb = buffer;
+                if ((size2 = SeekFile(fd2, 0, SEEK_END)) < 0) {
+                        err(3, "seek2 end");
+                }
 
-                for (; ; dumpLen -= cnt) {
-                        if ((bytesRead = read(fd, pb, staticSize)) < 0) {
-                                err(4, "read");
+                if (SeekFile(fd2, dumpEnd) < 0) {  // start2
+                        err(3, "seek2 set");
+                }
+
+                len = min(size, size2);
+
+                if (dumpLen > 0) {
+                        len = min(dumpLen, len);
+                }
+
+                Byte* b1 = bufFile1;
+                Byte* b2 = bufFile2;
+
+                for (Full out = 0; ; len -= size, cnt += size, out = 0) {
+                        if ((size1 = read(fd, b1, staticSize)) < 0) {
+                                err(4, file);
                         }
 
-                        if (! (cnt = min(bytesRead, dumpLen))) {
+                        if ((size2 = read(fd2, b2, staticSize)) < 0) {
+                                err(4, file2);
+                        }
+
+                        if (! (size = min(size1, size2))) {
                                 break;
                         }
 
-                        for (Size i=0; i < cnt; ++i) {
-                                putchar(pb[i]);
+                        if ((size = min(size, len)) <= 0) {
+                                break;
+                        }
+
+                        char *pbuf = bufPrint;
+
+                        for (Size i=0; i < size; ++i) {
+                                if (b1[i] != b2[i]) {
+                                        pbuf += sprintf(pbuf, "%.12lX  %.12lX:   %.2X  %.2X    %c  %c    %12lX  %15ld\n",
+                                                dumpBeg + cnt + i,
+                                                dumpEnd + cnt + i,
+                                                b1[i],
+                                                b2[i],
+                                                (b1[i] > '~' || b1[i] < ' ' ? ' ' : b1[i]),
+                                                (b2[i] > '~' || b2[i] < ' ' ? ' ' : b2[i]),
+                                                cnt + i,
+                                                cnt + i);
+
+                                        if (! (++out % outputSize)) {
+                                                if (fputs(bufPrint, stdout) == EOF) {
+                                                        err(5, "write stdout");
+                                                }
+
+                                                pbuf = bufPrint;
+                                                out = 0;
+                                        }
+                                }
+                        }
+
+                        if (out) {
+                                if (fputs(bufPrint, stdout) == EOF) {
+                                        err(5, "write stdout");
+                                }
+                        }
+                }
+
+                close(fd2);
+        }
+
+        else if (dumpMode == 2) {  // binary
+                for (Size i=0; ; dumpLen -= size, i=0) {
+                        if ((size = read(fd, buffer, staticSize)) < 0) {
+                                err(4, "read");
+                        }
+
+                        if ((size = min(size, dumpLen)) <= 0) {
+                                break;
+                        }
+
+                        for (; i + outputSize <= size; i += outputSize) {
+                                if (fwrite(buffer + i, 1, outputSize, stdout) != outputSize) {
+                                        err(5, "write stdout");
+                                }
+                        }
+
+                        if (fwrite(buffer + i, 1, size - i, stdout) != (size_t) (size - i)) {
+                                err(5, "write stdout");
                         }
                 }
         }
 
-        else {
+        else {  // ascii
                 Size tera = dumpBeg + dumpLen >= 68719476736 ? 3 : 0;
 
                 if (dumpWid > dumpMax) {
@@ -571,31 +662,34 @@ void dumpFile(char* file)
                 char addr[9];
                 sprintf(addr, "%%0%dlX ", tera ? 12 : 9);
 
-                Size lcnt = 9 + tera + 2 + (dumpWid - 1) / 8 + dumpWid * 3 + 1 + dumpWid;
-                char line[lcnt + 1] = { 0 };
+                cnt = 9 + tera + 2 + (dumpWid - 1) / 8 + dumpWid * 3 + 1 + dumpWid;
+                char line[cnt + 2] = { 0 };
+                line[cnt] = 10;
 
-                for (; ; dumpLen -= cnt, dumpBeg += cnt) {
-                        if ((bytesRead = read(fd, buffer, staticSize)) < 0) {
+                for (Full out = 0; ; dumpLen -= size, dumpBeg += size, out = 0) {
+                        if ((size = read(fd, buffer, staticSize)) < 0) {
                                 err(4, "read");
                         }
 
-                        if ((cnt = min(bytesRead, dumpLen)) <= 0) {
+                        if ((size = min(size, dumpLen)) <= 0) {
                                 printf(addr, dumpBeg);
 
                                 putchar(10);
                                 break;
                         }
 
-                        for (Size i=0; i < cnt; i += len) {
-                                if (i > cnt - dumpWid) {
-                                        memset(line, ' ', lcnt);
+                        char *pbuf = bufPrint;
+
+                        for (Size i=0; i < size; i += len) {
+                                if (i > size - dumpWid) {
+                                        memset(line, ' ', cnt);
                                 }
 
                                 char *pbufHex = line;
 
                                 pbufHex += sprintf(line, addr, dumpBeg + i);
 
-                                len = min(cnt - i, dumpWid);
+                                len = min(size - i, dumpWid);
 
                                 for (Size j=0; j < len; ++j) {
                                         if (! (j % 8)) {
@@ -606,19 +700,36 @@ void dumpFile(char* file)
 
                                         pbufHex += sprintf(pbufHex, "%02X ", b);
 
-                                        line[lcnt - dumpWid + j] = b > '~' || b < ' ' ? '.' : b;
+                                        line[cnt - dumpWid + j] = b > '~' || b < ' ' ? '.' : b;
                                 }
 
                                 *pbufHex = ' ';
 
-                                puts(line);
+                                pbuf = stpcpy(pbuf, line);
+
+                                if (! (++out % outputSize)) {
+                                        if (fputs(bufPrint, stdout) == EOF) {
+                                                err(5, "write stdout");
+                                        }
+
+                                        pbuf = bufPrint;
+                                        out = 0;
+                                }
+                        }
+
+                        if (out) {
+                                if (fputs(bufPrint, stdout) == EOF) {
+                                        err(5, "write stdout");
+                                }
                         }
                 }
         }
 
         close(fd);
 
-        exit(0);
+        if (fclose(stdout) == EOF) {
+                err(6, "stdout");
+        }
 } // end dumpFile
 
 //--------------------------------------------------------------------
@@ -649,14 +760,12 @@ FPos diffFile(char* file1, char* file2)
                         err(4, file2);
                 }
 
-                if (size1 == 0 && size2 == 0) {
-                        off = -1;
-                        break;
-                }
-
                 size = min(size1, size2);
 
-                if (size == 0) {
+                if (! size) {
+                        if (size1 == size2) {
+                                off = -1;
+                        }
                         break;
                 }
 
@@ -3314,6 +3423,8 @@ void ee()
 
 void processArgs(int argc, char** argv)
 {
+        char **arg = NULL;
+
         if (*argv[2] == '-') {
                 dumpMode = 1;
 
@@ -3321,46 +3432,19 @@ void processArgs(int argc, char** argv)
                         dumpMode = 2;
                 }
 
-                if (argv[3]) {
-                        Size tmp = strtol(argv[3], NULL, 0);
-
-                        if (strchr(argv[3], 'l')) {
-                                dumpLen = tmp;
-                        }
-                        else if (strchr(argv[3], 'w')) {
-                                dumpWid = tmp;
-                        }
-                        else {
-                                dumpBeg = tmp;
-                        }
-
-                        if (argv[4]) {
-                                tmp = strtol(argv[4], NULL, 0);
-
-                                if (strchr(argv[4], 'l')) {
-                                        dumpLen = tmp;
-                                }
-                                else if (strchr(argv[4], 'w')) {
-                                        dumpWid = tmp;
-                                }
-                                else {
-                                        dumpEnd = tmp;
-                                }
-
-                                if (argv[5]) {
-                                        dumpWid = strtol(argv[5], NULL, 0);
-                                }
-                        }
-                }
-
-                if (dumpWid <= 0) {
-                        dumpWid = dumpDef;
-                }
+                arg = argv + 3;
         }
 
         else if (argv[3] && *argv[3] == '-') {
                 if (*++argv[3] == '-') {
-                        diffMode = 2;
+                        if (*++argv[3] == '-') {
+                                dumpMode = 3;
+
+                                arg = argv + 4;
+                        }
+                        else {
+                                diffMode = 2;
+                        }
                 }
                 else {
                         diffMode = 1;
@@ -3395,6 +3479,49 @@ void processArgs(int argc, char** argv)
                                 file2.startAddr = file1.startAddr;
                         }
                 }
+        }
+
+        if (arg && *arg) {
+                Size tmp = strtol(*arg, NULL, 0);
+
+                if (strchr(*arg, 'l')) {
+                        dumpLen = tmp;
+                }
+                else if (strchr(*arg, 'w')) {
+                        dumpWid = tmp;
+                }
+                else {
+                        dumpBeg = tmp;
+                }
+
+                if (*++arg) {
+                        tmp = strtol(*arg, NULL, 0);
+
+                        if (strchr(*arg, 'l')) {
+                                dumpLen = tmp;
+                        }
+                        else if (strchr(*arg, 'w')) {
+                                dumpWid = tmp;
+                        }
+                        else {
+                                dumpEnd = tmp;  // start2
+                        }
+
+                        if (*++arg) {
+                                tmp = strtol(*arg, NULL, 0);
+
+                                if (dumpMode == 3) {
+                                        dumpLen = tmp;
+                                }
+                                else {
+                                        dumpWid = tmp;
+                                }
+                        }
+                }
+        }
+
+        if (dumpWid <= 0) {
+                dumpWid = dumpDef;
         }
 } // end processArgs
 
@@ -4035,19 +4162,23 @@ int main(int argc, char* argv[])
                 fprintf(stderr,
                         "%s\n"
                         "\n"
-                        "\t%s file [file2] [addr] [addr2]                     // ncurses\n"
+                        "\t%s file [file2] [addr] [addr2]                          // ncurses\n"
                         "\n"
-                        "\t%s file1 file2 -                                   // diff view\n"
                         "\n"
-                        "\t%s file1 file2 --                                  // diff exit\n"
+                        "\t%s file1 file2 -                                        // diff view\n"
                         "\n"
-                        "\t%s file -  [start [end]] [length{l$}] [width{w$}]  // dump ascii\n"
+                        "\t%s file1 file2 --                                       // diff exit\n"
                         "\n"
-                        "\t%s file -- [start [end]] [length{l$}]              // dump binary\n"
+                        "\n"
+                        "\t%s file        -   [start [end]] [len{l$}] [width{w$}]  // dump ascii\n"
+                        "\n"
+                        "\t%s file        --  [start [end]] [len{l$}]              // dump binary\n"
+                        "\n"
+                        "\t%s file1 file2 --- [start] [start2] [length{l$}]        // dump diff\n"
                         "\n"
                         "// type 'h' for help\n"
                         "\n",
-                        helpVersion + 1, program, program, program, program, program);
+                        helpVersion + 1, program, program, program, program, program, program);
 
                 exit(0);
         }
@@ -4057,7 +4188,8 @@ int main(int argc, char* argv[])
         }
 
         if (dumpMode) {
-                dumpFile(argv[1]);  // exit
+                dumpFile(argv[1], argv[2]);
+                exit(0);
         }
 
         if (diffMode) {
